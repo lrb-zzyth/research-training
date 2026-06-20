@@ -11,12 +11,14 @@ class GCN(nn.Module):
         self.conv2 = GCNConv(hid_dim, out_dim)
         self.dropout = dropout
 
-    def forward(self, data):
+    def forward(self, data, return_embedding=False):
         x, edge_index = data.x, data.edge_index
         x = self.conv1(x, edge_index)
         x = F.relu(x)
         embedding = F.dropout(x, p=self.dropout)
         x = self.conv2(embedding, edge_index)
+        if return_embedding:
+            return x, embedding
         return x
 
     def rep_forward(self, data):

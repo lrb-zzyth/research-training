@@ -46,22 +46,91 @@ parser.add_argument('--lam2', type=float, default=1)
 parser.add_argument('--topk', type=float, default=5)
 
 
+# loss improvements
+parser.add_argument('--use_weighted_ce', action='store_true', default=False)
+parser.add_argument('--class_weight_method', type=str, default='effective_num', choices=['inverse', 'effective_num'])
+parser.add_argument('--beta', type=float, default=0.999)
+parser.add_argument('--use_contrastive', action='store_true', default=False)
+parser.add_argument('--lambda_cl', type=float, default=0.1)
+parser.add_argument('--cl_tau', type=float, default=0.5)
 
 
 args = parser.parse_args()
 
+def compute_class_weights(labels, num_classes, method='effective_num', beta=0.999):
+    """
+    Compute per-class weights for Weighted CrossEntropy Loss.
+    labels: 1D tensor of class labels from local train_mask.
+    """
+    n_c = torch.bincount(labels, minlength=num_classes).float()
+
+    if method == 'effective_num':
+        # effective number of samples: weight_c = (1 - beta) / (1 - beta ** n_c)
+        weight_c = (1 - beta) / (1 - beta ** n_c)
+        weight_c[n_c == 0] = 0.0
+    elif method == 'inverse':
+        N = labels.shape[0]
+        weight_c = N / (num_classes * n_c)
+        weight_c[n_c == 0] = 0.0
+    else:
+        raise ValueError(f"Unknown class_weight_method: {method}")
+
+    # Normalize non-zero weights to have mean ~1
+    non_zero = weight_c > 0
+    if non_zero.sum() > 0:
+        weight_c[non_zero] = weight_c[non_zero] / weight_c[non_zero].mean()
+
+    return weight_c
 
 
+def supervised_contrastive_loss(embeddings, labels, tau=0.5):
+    """
+    Supervised Contrastive Loss (SupCon) on train nodes.
+    embeddings: [N, D] tensor from model penultimate layer.
+    labels: [N] class labels.
+    tau: temperature scaling.
+    Returns scalar loss (0 if no valid positive pair exists).
+    """
+    device = embeddings.device
+    labels = labels.view(-1)
 
+    # Normalize embeddings to unit sphere
+    embeddings = F.normalize(embeddings, p=2, dim=1)
 
+    # Similarity matrix: [N, N]
+    sim = torch.mm(embeddings, embeddings.t()) / tau
 
-    
+    # Positive mask: same-class pairs (excluding self)
+    label_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+    identity = torch.eye(labels.shape[0], device=device, dtype=torch.bool)
+    pos_mask = label_eq & ~identity
 
-    
-    
-    
-    
-    
+    # If no valid positive pair, return 0 to avoid NaN
+    if pos_mask.sum() == 0:
+        return torch.tensor(0.0, device=device)
+
+    # Numerical stability: subtract row-wise max
+    sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+    sim_stable = sim - sim_max.detach()
+    exp_sim = torch.exp(sim_stable)
+
+    # Denominator: sum over all negatives (all j != i)
+    neg_mask = ~identity
+    denom = (exp_sim * neg_mask.float()).sum(dim=1)  # [N]
+
+    # Numerator: sum of positive-pair exps per anchor
+    pos_exp = exp_sim * pos_mask.float()
+    numer = pos_exp.sum(dim=1)  # [N]
+
+    # Only consider anchors with at least one positive pair
+    valid = numer > 0
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device)
+
+    log_prob = torch.log(numer[valid] / denom[valid])
+    loss = -log_prob.mean()
+    return loss
+
 
 if __name__ == "__main__":
     
@@ -113,8 +182,20 @@ if __name__ == "__main__":
     
     
     normalized_ckr = ckr / ckr.sum(0)
-    
-    
+
+
+    # Pre-compute per-client class weights for Weighted CE (if enabled)
+    if args.use_weighted_ce:
+        class_weights = []
+        for client_id in range(args.num_clients):
+            train_labels = subgraphs[client_id].y[subgraphs[client_id].train_idx]
+            w = compute_class_weights(train_labels, dataset.num_classes,
+                                      args.class_weight_method, args.beta)
+            class_weights.append(w.to(device))
+        print(f"[class weights] computed for {args.num_clients} clients "
+              f"using '{args.class_weight_method}' method (beta={args.beta})")
+
+
     l_glb_acc_test = []
     
     for round_id in range(args.num_rounds):
@@ -168,10 +249,33 @@ if __name__ == "__main__":
             for epoch_id in range(args.num_epochs):
                 local_models[client_id].train()
                 local_optimizers[client_id].zero_grad()
-                
-                logits = local_models[client_id].forward(subgraphs[client_id])
-                loss_train = loss_fn(logits[subgraphs[client_id].train_idx], 
-                               subgraphs[client_id].y[subgraphs[client_id].train_idx])
+
+                if args.use_contrastive:
+                    logits, embeddings = local_models[client_id].forward(
+                        subgraphs[client_id], return_embedding=True)
+                else:
+                    logits = local_models[client_id].forward(subgraphs[client_id])
+
+                train_logits = logits[subgraphs[client_id].train_idx]
+                train_labels = subgraphs[client_id].y[subgraphs[client_id].train_idx]
+
+                # Weighted / standard CrossEntropy loss
+                if args.use_weighted_ce:
+                    ce_loss = F.cross_entropy(train_logits, train_labels,
+                                              weight=class_weights[client_id])
+                else:
+                    ce_loss = loss_fn(train_logits, train_labels)
+
+                loss = ce_loss
+
+                # Supervised Contrastive loss on train-node embeddings
+                if args.use_contrastive:
+                    train_embeddings = embeddings[subgraphs[client_id].train_idx]
+                    cl_loss = supervised_contrastive_loss(
+                        train_embeddings, train_labels, tau=args.cl_tau)
+                    loss = loss + args.lambda_cl * cl_loss
+
+                loss_train = loss
                 loss_train.backward()
                 local_optimizers[client_id].step()
                 
