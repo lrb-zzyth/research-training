@@ -1,9 +1,3 @@
-# FedTAD: Topology-aware Data-free Knowledge Distillation for Subgraph Federated Learning
-
-Official code repository of the paper "FedTAD: Topology-aware Data-free Knowledge Distillation for Subgraph Federated Learning" in the proceedings of International Joint Conference on Artificial Intelligence (IJCAI) 2024.
-
----
-
 ## 1. 解决的问题
 
 FedTAD 解决的是 **联邦图学习（Federated Graph Learning, FGL）** 中的 **非独立同分布（Non-IID）异构性** 问题。
