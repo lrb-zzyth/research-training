@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.optim import Adam
 from util.task_util import cal_topo_emb, accuracy, construct_graph, DiversityLoss
 from util.base_util import seed_everything, load_dataset
-from model import GCN, FedTAD_ConGenerator
+from model import GCN, FedTAD_ConGenerator, ConditionalDiffusionGenerator
 
 warnings.filterwarnings('ignore')
 
@@ -53,6 +53,14 @@ parser.add_argument('--beta', type=float, default=0.999)
 parser.add_argument('--use_contrastive', action='store_true', default=False)
 parser.add_argument('--lambda_cl', type=float, default=0.1)
 parser.add_argument('--cl_tau', type=float, default=0.5)
+
+
+# diffusion generator
+parser.add_argument('--generator_type', type=str, default='mlp', choices=['mlp', 'diffusion'])
+parser.add_argument('--diffusion_steps', type=int, default=50)
+parser.add_argument('--diffusion_hidden', type=int, default=256)
+parser.add_argument('--diffusion_beta_start', type=float, default=1e-4)
+parser.add_argument('--diffusion_beta_end', type=float, default=0.02)
 
 
 args = parser.parse_args()
@@ -150,7 +158,21 @@ if __name__ == "__main__":
                          out_dim=dataset.num_classes,
                          dropout=args.dropout).to(device)
     
-    generator = FedTAD_ConGenerator(noise_dim=32, feat_dim=args.hid_dim if args.fedtad_mode == 'rep_distill' else subgraphs[0].x.shape[1], out_dim=dataset.num_classes, dropout=0).to(device)
+    feat_dim = args.hid_dim if args.fedtad_mode == 'rep_distill' else subgraphs[0].x.shape[1]
+    if args.generator_type == 'diffusion':
+        generator = ConditionalDiffusionGenerator(
+            feat_dim=feat_dim,
+            num_classes=dataset.num_classes,
+            hidden_dim=args.diffusion_hidden,
+            num_steps=args.diffusion_steps,
+            beta_start=args.diffusion_beta_start,
+            beta_end=args.diffusion_beta_end,
+        ).to(device)
+        print(f"[generator] ConditionalDiffusionGenerator (steps={args.diffusion_steps}, "
+              f"hidden={args.diffusion_hidden}, feat_dim={feat_dim})")
+    else:
+        generator = FedTAD_ConGenerator(noise_dim=32, feat_dim=feat_dim,
+                                        out_dim=dataset.num_classes, dropout=0).to(device)
     global_optimizer = Adam(global_model.parameters(), lr=args.lr_d, weight_decay=args.weight_decay)
     generator_optimizer = Adam(generator.parameters(), lr=args.lr_g, weight_decay=args.weight_decay)
 
@@ -334,7 +356,11 @@ if __name__ == "__main__":
                 generator_optimizer.zero_grad()
                 for client_id in range(args.num_clients):
                     ######  generator forward  ########
-                    node_logits = generator.forward(z=z, c=c) 
+                    if args.generator_type == 'diffusion':
+                        node_logits = generator.sample(
+                            labels=c, num_steps=args.diffusion_steps, device=device)
+                    else:
+                        node_logits = generator.forward(z=z, c=c)
                     node_norm = F.normalize(node_logits, p=2, dim=1)
                     adj_logits = torch.mm(node_norm, node_norm.t())
                     pseudo_graph = construct_graph(
@@ -364,7 +390,13 @@ if __name__ == "__main__":
 
 
                     ############  diversity loss  ##############
-                    loss_div += DiversityLoss(metric='l1').to(device)(z.view(z.shape[0],-1), node_logits) 
+                    if args.generator_type == 'diffusion':
+                        z_for_div = torch.randn_like(node_logits)
+                        loss_div += DiversityLoss(metric='l1').to(device)(
+                            z_for_div, node_logits)
+                    else:
+                        loss_div += DiversityLoss(metric='l1').to(device)(
+                            z.view(z.shape[0],-1), node_logits)
                 
                 
                     ############  divergence loss  ############   
@@ -390,9 +422,14 @@ if __name__ == "__main__":
                 global_optimizer.zero_grad()
                 loss_D = 0
                 
-                for client_id in range(args.num_clients):    
+                for client_id in range(args.num_clients):
                     ######  generator forward  ########
-                    node_logits = generator.forward(z=z, c=c)                    
+                    if args.generator_type == 'diffusion':
+                        with torch.no_grad():
+                            node_logits = generator.sample(
+                                labels=c, num_steps=args.diffusion_steps, device=device)
+                    else:
+                        node_logits = generator.forward(z=z, c=c)
                     node_norm = F.normalize(node_logits, p=2, dim=1)
                     adj_logits = torch.mm(node_norm, node_norm.t())
                     pseudo_graph = construct_graph(node_logits.detach(), adj_logits.detach(), k=args.topk)
