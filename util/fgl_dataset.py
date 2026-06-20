@@ -72,7 +72,8 @@ class FGLDataset(Dataset):
 
     def get(self, idx):
         data = torch.load(
-            osp.join(self.processed_dir, "data{}.pt".format(idx)))
+            osp.join(self.processed_dir, "data{}.pt".format(idx)),
+            weights_only=False)
         return data
 
     def process(self):
