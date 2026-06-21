@@ -302,3 +302,51 @@ FedTAD/
 }
 ```
 
+---
+
+## 11. Web UI 可视化管理平台
+
+项目还提供了一个基于 Web 的可视化训练管理平台，位于 `research-training/` 目录下。
+
+### 功能
+
+- 用户登录（JWT 认证）
+- 训练参数配置面板
+- 一键启动/中断训练
+- 实时查看训练日志（WebSocket 推送）
+- 实时 global_val / global_test / best_val / best_test 曲线（ECharts）
+- 实验历史记录管理（PostgreSQL 持久化）
+
+### 技术栈
+
+| 层级 | 技术 |
+|---|---|
+| 前端 | Vue 3 + Vite + Element Plus + ECharts + Pinia |
+| 后端 | FastAPI + SQLAlchemy (async) + asyncpg |
+| 数据库 | PostgreSQL |
+| 认证 | JWT + bcrypt |
+| 实时通信 | WebSocket |
+| 训练执行 | asyncio subprocess |
+
+### 快速启动
+
+```bash
+# 1. 创建数据库
+createdb fedtad
+
+# 2. 启动后端
+cd research-training/backend
+cp .env.example .env
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# 3. 启动前端（另一个终端）
+cd research-training/frontend
+npm install
+npm run dev
+```
+
+打开 http://localhost:5173，使用 `admin / admin123` 登录。
+
+详细文档请参见 `research-training/README.md`。
+

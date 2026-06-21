@@ -40,3 +40,13 @@ Thumbs.db
 .env
 *.key
 *.pem
+
+# Node.js (frontend)
+node_modules/
+dist/
+
+
+# Environment files
+**/.env
+**/.env.*
+!**/.env.example
