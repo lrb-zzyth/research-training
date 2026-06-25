@@ -8,6 +8,8 @@ from torch.optim import Adam
 from util.task_util import cal_topo_emb, accuracy, construct_graph, DiversityLoss
 from util.base_util import seed_everything, load_dataset
 from model import GCN, FedTAD_ConGenerator, ConditionalDiffusionGenerator
+from torch_geometric.data import Data
+from util.gradate_contrastive import GradateContrastiveModule, aug_random_edge_pyg
 
 warnings.filterwarnings('ignore')
 
@@ -53,6 +55,19 @@ parser.add_argument('--beta', type=float, default=0.999)
 parser.add_argument('--use_contrastive', action='store_true', default=False)
 parser.add_argument('--lambda_cl', type=float, default=0.1)
 parser.add_argument('--cl_tau', type=float, default=0.5)
+
+
+# contrastive learning mode
+parser.add_argument('--contrastive_type', type=str, default='supcon',
+                    choices=['supcon', 'gradate'])
+parser.add_argument('--gradate_tau', type=float, default=0.5)
+parser.add_argument('--gradate_edge_drop_rate', type=float, default=0.2)
+parser.add_argument('--gradate_beta', type=float, default=0.1)
+parser.add_argument('--gradate_gamma', type=float, default=0.1)
+parser.add_argument('--gradate_alpha', type=float, default=0.1)
+parser.add_argument('--gradate_subgraph_size', type=int, default=4)
+parser.add_argument('--gradate_negsamp_ratio_patch', type=int, default=6)
+parser.add_argument('--gradate_negsamp_ratio_context', type=int, default=1)
 
 
 # diffusion generator
@@ -218,6 +233,41 @@ if __name__ == "__main__":
               f"using '{args.class_weight_method}' method (beta={args.beta})")
 
 
+    # GRADATE contrastive modules (one per client, not shared)
+    gradate_modules = None
+    gradate_optimizers = None
+    gradate_aug_edge_indices = None
+    if args.use_contrastive and args.contrastive_type == 'gradate':
+        gradate_modules = [
+            GradateContrastiveModule(
+                hidden_dim=args.hid_dim,
+                negsamp_ratio_patch=args.gradate_negsamp_ratio_patch,
+                negsamp_ratio_context=args.gradate_negsamp_ratio_context,
+                beta=args.gradate_beta,
+                gamma=args.gradate_gamma,
+                alpha=args.gradate_alpha,
+                tau=args.gradate_tau,
+            ).to(device)
+            for _ in range(args.num_clients)
+        ]
+        gradate_optimizers = [
+            Adam(gradate_modules[i].parameters(),
+                 lr=args.lr, weight_decay=args.weight_decay)
+            for i in range(args.num_clients)
+        ]
+        # Fixed augmented edge indices (generated once, not per epoch)
+        gradate_aug_edge_indices = [
+            aug_random_edge_pyg(
+                subgraphs[ci].edge_index,
+                subgraphs[ci].x.shape[0],
+                args.gradate_edge_drop_rate).to(device)
+            for ci in range(args.num_clients)
+        ]
+        print(f"[gradate] GRADATE contrastive enabled for {args.num_clients} clients "
+              f"(subgraph_size={args.gradate_subgraph_size}, "
+              f"edge_drop_rate={args.gradate_edge_drop_rate})")
+
+
     l_glb_acc_test = []
     
     for round_id in range(args.num_rounds):
@@ -272,7 +322,17 @@ if __name__ == "__main__":
                 local_models[client_id].train()
                 local_optimizers[client_id].zero_grad()
 
-                if args.use_contrastive:
+                # --- GRADATE: also run augmented view forward ---
+                if args.use_contrastive and args.contrastive_type == 'gradate':
+                    # Original view
+                    logits, embeddings = local_models[client_id].forward(
+                        subgraphs[client_id], return_embedding=True)
+                    # Augmented view (fixed edge perturbation, reused each epoch)
+                    aug_data = subgraphs[client_id].clone()
+                    aug_data.edge_index = gradate_aug_edge_indices[client_id]
+                    _, embeddings_hat = local_models[client_id].forward(
+                        aug_data, return_embedding=True)
+                elif args.use_contrastive:
                     logits, embeddings = local_models[client_id].forward(
                         subgraphs[client_id], return_embedding=True)
                 else:
@@ -290,16 +350,28 @@ if __name__ == "__main__":
 
                 loss = ce_loss
 
-                # Supervised Contrastive loss on train-node embeddings
+                # Contrastive loss
                 if args.use_contrastive:
-                    train_embeddings = embeddings[subgraphs[client_id].train_idx]
-                    cl_loss = supervised_contrastive_loss(
-                        train_embeddings, train_labels, tau=args.cl_tau)
+                    if args.contrastive_type == 'gradate':
+                        gradate_optimizers[client_id].zero_grad()
+                        cl_loss = gradate_modules[client_id](
+                            embeddings, embeddings_hat,
+                            subgraphs[client_id].edge_index,
+                            gradate_aug_edge_indices[client_id],
+                            subgraphs[client_id].train_idx,
+                            subgraph_size=args.gradate_subgraph_size,
+                        )
+                    else:
+                        train_embeddings = embeddings[subgraphs[client_id].train_idx]
+                        cl_loss = supervised_contrastive_loss(
+                            train_embeddings, train_labels, tau=args.cl_tau)
                     loss = loss + args.lambda_cl * cl_loss
 
                 loss_train = loss
                 loss_train.backward()
                 local_optimizers[client_id].step()
+                if args.use_contrastive and args.contrastive_type == 'gradate':
+                    gradate_optimizers[client_id].step()
                 
         # global aggregation
         with torch.no_grad():
