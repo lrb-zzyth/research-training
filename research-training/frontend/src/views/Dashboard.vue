@@ -11,15 +11,19 @@
       >
         <el-menu-item index="/training/config">
           <el-icon><Plus /></el-icon>
-          <span>Start Training</span>
+          <span>{{ $t('开始训练（Start Training）') }}</span>
         </el-menu-item>
         <el-menu-item index="/training/monitor">
           <el-icon><Monitor /></el-icon>
-          <span>Training Monitor</span>
+          <span>{{ $t('训练监控（Training Monitor）') }}</span>
         </el-menu-item>
         <el-menu-item index="/experiments">
-          <el-icon><History /></el-icon>
-          <span>Experiment History</span>
+          <el-icon><Clock /></el-icon>
+          <span>{{ $t('实验历史（Experiment History）') }}</span>
+        </el-menu-item>
+        <el-menu-item index="/settings">
+          <el-icon><Setting /></el-icon>
+          <span>{{ $t('设置（Settings）') }}</span>
         </el-menu-item>
       </el-menu>
     </el-aside>
@@ -32,7 +36,7 @@
           </span>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="logout">Logout</el-dropdown-item>
+              <el-dropdown-item command="logout">{{ $t('退出登录（Logout）') }}</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -47,7 +51,7 @@
 <script setup>
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
-import { Plus, Monitor, History, ArrowDown } from '@element-plus/icons-vue'
+import { Plus, Monitor, Clock, Setting, ArrowDown } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()

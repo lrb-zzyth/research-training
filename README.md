@@ -143,7 +143,8 @@ loss = weighted_ce_loss + lambda_cl × contrastive_loss
 | 改进 | 说明 |
 |---|---|
 | **Weighted CE** | 基于本地 `train_mask` 标签分布计算类别权重。支持 `effective_num`（默认，`weight_c = (1-β)/(1-βⁿᶜ)`）和 `inverse`（`weight_c = N/(num_classes × n_c)`）两种方法。缺失类别权重置 0，非零权重归一化到均值约 1 |
-| **Supervised Contrastive Loss** | 在 GCN 倒数第二层 embedding 上计算。同类节点为正样本，异类节点为负样本。无有效正样本时返回 0（避免 NaN） |
+| **Supervised Contrastive Loss**（`--contrastive_type supcon`）| 在 GCN 倒数第二层 embedding 上计算。同类节点为正样本，异类节点为负样本。无有效正样本时返回 0（避免 NaN） |
+| **GRADATE Multi-Scale Contrastive Loss**（`--contrastive_type gradate`）| 自监督多尺度对比损失，包含 node-subgraph、node-node、subgraph-subgraph cross-view InfoNCE 三种损失。通过 edge perturbation 构造增强 view，RWR 子图采样。参考 GRADATE 论文结构 |
 
 ### 阶段 4：服务端蒸馏
 
@@ -232,9 +233,23 @@ loss = weighted_ce_loss + lambda_cl × contrastive_loss
 | `--use_weighted_ce` | False | 启用 Weighted CE |
 | `--class_weight_method` | effective_num | 加权方法（effective_num / inverse）|
 | `--beta` | 0.999 | effective number 参数 |
-| `--use_contrastive` | False | 启用对比损失 |
+| `--use_contrastive` | False | 启用对比损失（总开关）|
+| `--contrastive_type` | supcon | 对比损失类型：`supcon`（监督式）或 `gradate`（GRADATE 多尺度自监督）|
 | `--lambda_cl` | 0.1 | 对比损失权重 |
-| `--cl_tau` | 0.5 | 对比损失温度 |
+| `--cl_tau` | 0.5 | SupCon 温度参数 |
+
+### GRADATE 对比学习参数（`--contrastive_type gradate` 时生效）
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--gradate_tau` | 0.5 | 子图-子图 InfoNCE 温度 |
+| `--gradate_edge_drop_rate` | 0.2 | 增强 view 边增删比例 |
+| `--gradate_beta` | 0.1 | Node-Subgraph vs Node-Node 权重平衡 |
+| `--gradate_gamma` | 0.1 | Subgraph-Subgraph NCE 权重 |
+| `--gradate_alpha` | 0.1 | 原始 view vs 增强 view 加权 |
+| `--gradate_subgraph_size` | 4 | RWR 子图 context 节点数（不含 anchor）|
+| `--gradate_negsamp_ratio_patch` | 6 | Node-Node 负采样比 |
+| `--gradate_negsamp_ratio_context` | 1 | Node-Subgraph 负采样比 |
 
 ---
 
@@ -253,7 +268,7 @@ python train_fedtad.py --dataset Cora --num_clients 10 --partition Louvain \
   --generator_type diffusion --diffusion_steps 10
 ```
 
-### 8.3 扩散生成器 + 客户端改进
+### 8.3 SupCon 监督式对比 + 扩散生成器
 
 ```bash
 python train_fedtad.py --dataset Cora --num_clients 10 --partition Louvain \
@@ -261,7 +276,23 @@ python train_fedtad.py --dataset Cora --num_clients 10 --partition Louvain \
   --use_weighted_ce --use_contrastive --lambda_cl 0.1
 ```
 
-### 8.4 FedAvg 基线
+### 8.4 GRADATE 多尺度自监督对比
+
+```bash
+python train_fedtad.py --dataset Cora --num_clients 10 --partition Louvain \
+  --use_contrastive --contrastive_type gradate
+```
+
+### 8.5 GRADATE + 扩散生成器 + Weighted CE（全功能）
+
+```bash
+python train_fedtad.py --dataset Cora --num_clients 10 --partition Louvain \
+  --generator_type diffusion --diffusion_steps 10 \
+  --use_weighted_ce \
+  --use_contrastive --contrastive_type gradate
+```
+
+### 8.6 FedAvg 基线
 
 ```bash
 python train_fedavg.py --dataset Cora --num_clients 10 --partition Louvain
@@ -282,7 +313,8 @@ FedTAD/
 │   ├── base_data_util.py        # 图切分（Louvain/Metis）+ 子图构建
 │   ├── base_util.py             # 种子设置 + 数据加载
 │   ├── fgl_dataset.py           # FGLDataset 类
-│   └── task_util.py             # accuracy / DiversityLoss / construct_graph
+│   ├── task_util.py             # accuracy / DiversityLoss / construct_graph
+│   └── gradate_contrastive.py   # GRADATE 多尺度对比学习模块
 ├── louvain/                     # Louvain 社区发现算法实现
 └── ckr/                         # CKR 矩阵缓存
 ```

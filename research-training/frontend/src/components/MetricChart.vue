@@ -2,7 +2,7 @@
   <el-card shadow="never">
     <template #header>
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span>Global Metrics</span>
+        <span>{{ $t('全局指标（Global Metrics）') }}</span>
         <el-radio-group v-model="chartType" size="small">
           <el-radio-button value="global">global_val / global_test</el-radio-button>
           <el-radio-button value="best">best_val / best_test</el-radio-button>
@@ -47,8 +47,8 @@ const chartOption = computed(() => {
     tooltip: { trigger: 'axis' },
     legend: { data: series.map(s => s.name) },
     grid: { left: 50, right: 20, bottom: 30, top: 40 },
-    xAxis: { type: 'category', data: rounds, name: 'Round' },
-    yAxis: { type: 'value', name: 'Accuracy (%)' },
+    xAxis: { type: 'category', data: rounds, name: '轮次（Round）' },
+    yAxis: { type: 'value', name: '准确率（Accuracy %）' },
     series,
   }
 })

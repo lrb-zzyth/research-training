@@ -1,13 +1,12 @@
 <template>
   <div>
-    <h2>Experiment History</h2>
+    <h2>{{ $t('实验历史（Experiment History）') }}</h2>
     <ExperimentTable @view="viewExperiment" />
   </div>
 </template>
 
 <script setup>
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import ExperimentTable from '../components/ExperimentTable.vue'
 
 const router = useRouter()

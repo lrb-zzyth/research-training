@@ -1,11 +1,11 @@
 <template>
   <el-card shadow="never" style="height:100%; display:flex; flex-direction:column;">
     <template #header>
-      <span>Training Logs</span>
+      <span>{{ $t('训练日志（Training Logs）') }}</span>
     </template>
     <div ref="logContainer" class="log-container">
       <div v-for="(log, i) in logs" :key="i" class="log-line">{{ log }}</div>
-      <div v-if="logs.length === 0" class="log-empty">Waiting for logs...</div>
+      <div v-if="logs.length === 0" class="log-empty">{{ $t('等待日志...（Waiting for logs...）') }}</div>
     </div>
   </el-card>
 </template>

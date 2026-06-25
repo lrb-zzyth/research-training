@@ -1,23 +1,23 @@
 <template>
   <div class="login-container">
-    <el-card class="login-card" header="FedTAD Training Manager">
+    <el-card class="login-card" :header="$t('FedTAD Training Manager')">
       <el-form @submit.prevent="handleLogin" label-position="top">
-        <el-form-item label="Username">
-          <el-input v-model="username" placeholder="Enter username" />
+        <el-form-item :label="$t('用户名（Username）')">
+          <el-input v-model="username" :placeholder="$t('输入用户名（Enter username）')" />
         </el-form-item>
-        <el-form-item label="Password">
-          <el-input v-model="password" type="password" placeholder="Enter password" show-password />
+        <el-form-item :label="$t('密码（Password）')">
+          <el-input v-model="password" type="password" :placeholder="$t('输入密码（Enter password）')" show-password />
         </el-form-item>
         <el-form-item>
           <el-button type="primary" native-type="submit" :loading="loading" style="width:100%">
-            Login
+            {{ $t('登录（Login）') }}
           </el-button>
         </el-form-item>
         <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" />
         <div style="text-align:center; margin-top:12px">
           <span style="color:#666; font-size:13px;">
-            No account?
-            <router-link to="/register" style="color:#409eff; text-decoration:none;">Register</router-link>
+            {{ $t('没有账号？（No account?）') }}
+            <router-link to="/register" style="color:#409eff; text-decoration:none;">{{ $t('去注册（Register）') }}</router-link>
           </span>
         </div>
       </el-form>
@@ -45,7 +45,7 @@ async function handleLogin() {
     await auth.login(username.value, password.value)
     router.push('/')
   } catch (e) {
-    error.value = e.response?.data?.detail || 'Login failed'
+    error.value = e.response?.data?.detail || '登录失败（Login failed）'
   } finally {
     loading.value = false
   }

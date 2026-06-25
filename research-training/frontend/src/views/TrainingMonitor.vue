@@ -1,24 +1,24 @@
 <template>
   <div>
     <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h2>Training Monitor</h2>
+      <h2>{{ $t('训练监控（Training Monitor）') }}</h2>
       <div>
         <el-tag :type="statusTag" size="large">{{ statusText }}</el-tag>
         <el-button v-if="store.isRunning" type="danger" @click="handleStop" :loading="stopping" style="margin-left:12px">
-          Stop Training
+          {{ $t('停止训练（Stop Training）') }}
         </el-button>
       </div>
     </div>
 
     <el-descriptions v-if="experiment" :column="3" border size="small" style="margin:12px 0">
-      <el-descriptions-item label="Experiment ID">{{ experiment.id }}</el-descriptions-item>
-      <el-descriptions-item label="Name">{{ experiment.name }}</el-descriptions-item>
-      <el-descriptions-item label="Status">
+      <el-descriptions-item :label="$t('实验 ID（Experiment ID）')">{{ experiment.id }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('名称（Name）')">{{ experiment.name }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('状态（Status）')">
         <el-tag :type="statusTag" size="small">{{ experiment.status }}</el-tag>
       </el-descriptions-item>
-      <el-descriptions-item label="Best Val">{{ experiment.best_val ?? '-' }}</el-descriptions-item>
-      <el-descriptions-item label="Best Test">{{ experiment.best_test ?? '-' }}</el-descriptions-item>
-      <el-descriptions-item label="Best Round">{{ experiment.best_round ?? '-' }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('最佳验证准确率（Best Val）')">{{ experiment.best_val ?? '-' }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('最佳测试准确率（Best Test）')">{{ experiment.best_test ?? '-' }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('最优轮次（Best Round）')">{{ experiment.best_round ?? '-' }}</el-descriptions-item>
     </el-descriptions>
 
     <el-row :gutter="16" style="margin-top:12px">
@@ -53,7 +53,8 @@ const statusTag = computed(() => {
   return map[experiment.value?.status] || 'info'
 })
 const statusText = computed(() => {
-  return experiment.value?.status || 'N/A'
+  const map = { running: '运行中（Running）', finished: '已完成（Finished）', failed: '失败（Failed）', stopped: '已停止（Stopped）', pending: '等待中（Pending）' }
+  return map[experiment.value?.status] || experiment.value?.status || 'N/A'
 })
 
 function connectWebSocket(experimentId) {
@@ -75,7 +76,6 @@ function connectWebSocket(experimentId) {
   }
 
   ws.onclose = () => {
-    // Reconnect after 3s if training might still be running
     if (experiment.value?.status === 'running') {
       setTimeout(() => {
         if (experiment.value) connectWebSocket(experiment.value.id)
@@ -90,25 +90,23 @@ async function loadExperiment(id) {
     experiment.value = res.data
     store.currentExperimentId = id
 
-    // Load historical metrics
     const metricsRes = await getExperimentMetrics(id)
     store.serverMetrics = metricsRes.data.filter(m => m.source === 'server' || m.source === 'best')
     store.clientMetrics = metricsRes.data.filter(m => m.source.startsWith('client'))
 
-    // Connect WebSocket for real-time updates
     connectWebSocket(id)
   } catch (e) {
-    ElMessage.error('Failed to load experiment')
+    ElMessage.error('加载实验失败（Failed to load experiment）')
   }
 }
 
 async function handleStop() {
   try {
-    await ElMessageBox.confirm('Are you sure you want to stop this training?')
+    await ElMessageBox.confirm('确定要停止当前训练吗？（Are you sure you want to stop this training?）')
     stopping.value = true
     await store.stop()
     if (experiment.value) experiment.value.status = 'stopped'
-    ElMessage.success('Training stopped')
+    ElMessage.success('训练已停止（Training stopped）')
   } catch {
     // Canceled
   } finally {
