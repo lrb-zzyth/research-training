@@ -50,3 +50,4 @@ dist/
 **/.env
 **/.env.*
 !**/.env.example
+references/
