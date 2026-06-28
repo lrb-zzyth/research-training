@@ -59,12 +59,18 @@ parser.add_argument('--cl_tau', type=float, default=0.5)
 
 # contrastive learning mode
 parser.add_argument('--contrastive_type', type=str, default='supcon',
-                    choices=['supcon', 'gradate'])
+                    choices=['supcon', 'gradate', 'node_node'],
+                    help='supcon: supervised node-node contrast; '
+                         'gradate: three-scale (NS + NN + SS); '
+                         'node_node: node-node contrast only (PatchDiscriminator)')
 parser.add_argument('--gradate_tau', type=float, default=0.5)
 parser.add_argument('--gradate_edge_drop_rate', type=float, default=0.2)
-parser.add_argument('--gradate_beta', type=float, default=0.1)
-parser.add_argument('--gradate_gamma', type=float, default=0.1)
-parser.add_argument('--gradate_alpha', type=float, default=0.1)
+parser.add_argument('--gradate_beta', type=float, default=0.1,
+                    help='[gradate only] weight for node-subgraph loss')
+parser.add_argument('--gradate_gamma', type=float, default=0.1,
+                    help='[gradate only] weight for subgraph-subgraph loss')
+parser.add_argument('--gradate_alpha', type=float, default=0.1,
+                    help='fusion weight between original (alpha) and augmented (1-alpha) views')
 parser.add_argument('--gradate_subgraph_size', type=int, default=4)
 parser.add_argument('--gradate_negsamp_ratio_patch', type=int, default=6)
 parser.add_argument('--gradate_negsamp_ratio_context', type=int, default=1)
@@ -233,11 +239,11 @@ if __name__ == "__main__":
               f"using '{args.class_weight_method}' method (beta={args.beta})")
 
 
-    # GRADATE contrastive modules (one per client, not shared)
+    # GRADATE / Node-Node contrastive modules (one per client)
     gradate_modules = None
     gradate_optimizers = None
     gradate_aug_edge_indices = None
-    if args.use_contrastive and args.contrastive_type == 'gradate':
+    if args.use_contrastive and args.contrastive_type in ('gradate', 'node_node'):
         gradate_modules = [
             GradateContrastiveModule(
                 hidden_dim=args.hid_dim,
@@ -263,8 +269,9 @@ if __name__ == "__main__":
                 args.gradate_edge_drop_rate).to(device)
             for ci in range(args.num_clients)
         ]
-        print(f"[gradate] GRADATE contrastive enabled for {args.num_clients} clients "
-              f"(subgraph_size={args.gradate_subgraph_size}, "
+        mode_name = args.contrastive_type  # 'gradate' or 'node_node'
+        print(f"[{mode_name}] contrastive enabled for {args.num_clients} clients "
+              f"(mode={mode_name}, subgraph_size={args.gradate_subgraph_size}, "
               f"edge_drop_rate={args.gradate_edge_drop_rate})")
 
 
@@ -322,8 +329,8 @@ if __name__ == "__main__":
                 local_models[client_id].train()
                 local_optimizers[client_id].zero_grad()
 
-                # --- GRADATE: also run augmented view forward ---
-                if args.use_contrastive and args.contrastive_type == 'gradate':
+                # --- GRADATE / NN: also run augmented view forward ---
+                if args.use_contrastive and args.contrastive_type in ('gradate', 'node_node'):
                     # Original view
                     logits, embeddings = local_models[client_id].forward(
                         subgraphs[client_id], return_embedding=True)
@@ -360,17 +367,33 @@ if __name__ == "__main__":
                             gradate_aug_edge_indices[client_id],
                             subgraphs[client_id].train_idx,
                             subgraph_size=args.gradate_subgraph_size,
+                            mode='gradate',
                         )
+                    elif args.contrastive_type == 'node_node':
+                        gradate_optimizers[client_id].zero_grad()
+                        cl_loss = gradate_modules[client_id](
+                            embeddings, embeddings_hat,
+                            subgraphs[client_id].edge_index,
+                            gradate_aug_edge_indices[client_id],
+                            subgraphs[client_id].train_idx,
+                            subgraph_size=args.gradate_subgraph_size,
+                            mode='node_node',
+                        )
+                        print(f"  [client {client_id} epoch {epoch_id}] "
+                              f"classification_loss: {ce_loss.item():.4f}  "
+                              f"node_node_contrastive_loss: {cl_loss.item():.4f}  "
+                              f"total_loss: {(ce_loss + args.lambda_cl * cl_loss).item():.4f}")
                     else:
                         train_embeddings = embeddings[subgraphs[client_id].train_idx]
                         cl_loss = supervised_contrastive_loss(
                             train_embeddings, train_labels, tau=args.cl_tau)
+
                     loss = loss + args.lambda_cl * cl_loss
 
                 loss_train = loss
                 loss_train.backward()
                 local_optimizers[client_id].step()
-                if args.use_contrastive and args.contrastive_type == 'gradate':
+                if args.use_contrastive and args.contrastive_type in ('gradate', 'node_node'):
                     gradate_optimizers[client_id].step()
                 
         # global aggregation

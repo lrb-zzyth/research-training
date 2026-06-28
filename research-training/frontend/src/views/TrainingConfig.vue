@@ -118,7 +118,8 @@
         <el-form-item :label="$t('对比学习类型（Contrastive Type）')">
           <el-select v-model="config.contrastive_type" style="width:200px">
             <el-option :label="$t('SupCon（监督式 / Supervised）')" value="supcon" />
-            <el-option :label="$t('GRADATE（自监督 / Self-supervised）')" value="gradate" />
+            <el-option :label="$t('Node-Node（节点对比 / PatchDisc）')" value="node_node" />
+            <el-option :label="$t('GRADATE（三尺度 / Three-scale）')" value="gradate" />
           </el-select>
         </el-form-item>
         <el-form-item :label="$t('对比损失权重（Lambda CL）')">
@@ -153,6 +154,20 @@
           </el-form-item>
           <el-form-item :label="$t('负采样比 / 子图（Neg Ratio Context）')">
             <el-input-number v-model="config.gradate_negsamp_ratio_context" :min="1" :max="10" />
+          </el-form-item>
+        </template>
+        <template v-if="config.contrastive_type === 'node_node'">
+          <el-form-item :label="$t('边增删比例（Edge Drop Rate）')">
+            <el-input-number v-model="config.gradate_edge_drop_rate" :min="0.01" :max="0.5" :step="0.01" />
+          </el-form-item>
+          <el-form-item :label="$t('子图大小（Subgraph Size）')">
+            <el-input-number v-model="config.gradate_subgraph_size" :min="2" :max="20" />
+          </el-form-item>
+          <el-form-item :label="$t('权重 Alpha（原始 View vs 增强 View）')">
+            <el-input-number v-model="config.gradate_alpha" :min="0" :max="1" :step="0.01" />
+          </el-form-item>
+          <el-form-item :label="$t('负采样比 / 节点（Neg Ratio Patch）')">
+            <el-input-number v-model="config.gradate_negsamp_ratio_patch" :min="1" :max="20" />
           </el-form-item>
         </template>
       </template>

@@ -311,7 +311,7 @@ class GradateContrastiveModule(nn.Module):
         return nce.mean()
 
     def forward(self, embeddings, embeddings_hat, edge_index, aug_edge_index,
-                train_idx, subgraph_size=4):
+                train_idx, subgraph_size=4, mode='gradate'):
         """
         Args:
             embeddings:      [N, H]   original-view node embeddings
@@ -320,9 +320,13 @@ class GradateContrastiveModule(nn.Module):
             aug_edge_index:  [2, E']  augmented edges
             train_idx:       boolean mask [N]  or long indices
             subgraph_size:   context nodes PER subgraph (excl. anchor)
+            mode:            'gradate' (default, three-scale) or
+                             'node_node' (node-node contrast only)
 
         Returns:
-            total_loss: scalar Tensor with gradient flowing to local_model
+            scalar Tensor:
+              mode='gradate'   -> beta*L_NS + (1-beta)*L_NN + gamma*L_SS
+              mode='node_node' -> L_NN  (with alpha fusion of two views)
         """
         device = embeddings.device
 
@@ -343,6 +347,8 @@ class GradateContrastiveModule(nn.Module):
             return torch.tensor(0.0, device=device)
 
         # ---- 2. RWR subgraph sampling (CPU) ----
+        # Required for both modes: NN contrast uses sub_emb[:,0,:] as the
+        # positive "other" node paired with the anchor.
         num_nodes = embeddings.shape[0]
         subgraphs = rwr_subgraph_sampling(
             edge_index, num_nodes, anchor_nodes.cpu(),
@@ -361,21 +367,37 @@ class GradateContrastiveModule(nn.Module):
         sub_emb = torch.cat(sub_emb_list, dim=0)        # [B, S+1, H]
         sub_emb_hat = torch.cat(sub_emb_hat_list, dim=0)  # [B, S+1, H]
 
-        # ---- 4. Split: anchor vs context ----
+        # ---- 4. Split: anchor vs "other" (first context node) ----
         anchor_emb = sub_emb[:, -1, :]             # [B, H]
         anchor_emb_hat = sub_emb_hat[:, -1, :]     # [B, H]
-        context_emb = self.readout(sub_emb[:, :-1, :])        # [B, H]
-        context_emb_hat = self.readout(sub_emb_hat[:, :-1, :])  # [B, H]
         other_emb = sub_emb[:, 0, :]                # [B, H]  first context node
         other_emb_hat = sub_emb_hat[:, 0, :]        # [B, H]
 
-        # ---- 5. BCE labels (must match logits shape) ----
-        lbl_context = self._bce_labels(batch_size, self.negsamp_ratio_context, device)
+        # ---- 5. Node-node contrast (shared by both modes) ----
         lbl_patch = self._bce_labels(batch_size, self.negsamp_ratio_patch, device)
-
-        # pos_weight tensors on the correct device
-        pw_context = torch.tensor([self.negsamp_ratio_context], device=device, dtype=torch.float)
         pw_patch = torch.tensor([self.negsamp_ratio_patch], device=device, dtype=torch.float)
+
+        logits_p = self.p_disc(other_emb, anchor_emb)           # [B*(1+np), 1]
+        logits_p_hat = self.p_disc(other_emb_hat, anchor_emb_hat)
+        loss_p = (self.bce_patch(logits_p, lbl_patch) * pw_patch).mean()
+        loss_p_hat = (self.bce_patch(logits_p_hat, lbl_patch) * pw_patch).mean()
+        node_node_loss = self.alpha * loss_p + (1 - self.alpha) * loss_p_hat
+
+        # ---- Early return for node_node-only mode ----
+        if mode == 'node_node':
+            # Skip readout, ContextualDiscriminator, and cross-view InfoNCE,
+            # avoiding both computation and GPU memory traffic for unused ops.
+            return node_node_loss
+
+        # =====================================================================
+        #  Full gradate mode: additional losses below
+        # =====================================================================
+        context_emb = self.readout(sub_emb[:, :-1, :])           # [B, H]
+        context_emb_hat = self.readout(sub_emb_hat[:, :-1, :])   # [B, H]
+
+        # BCE labels & pos_weight for ContextualDiscriminator
+        lbl_context = self._bce_labels(batch_size, self.negsamp_ratio_context, device)
+        pw_context = torch.tensor([self.negsamp_ratio_context], device=device, dtype=torch.float)
 
         # ---- 6. Node-subgraph contrast ----
         logits_c = self.c_disc(context_emb, anchor_emb)         # [B*(1+nc), 1]
@@ -384,17 +406,10 @@ class GradateContrastiveModule(nn.Module):
         loss_c_hat = (self.bce_context(logits_c_hat, lbl_context) * pw_context).mean()
         node_subgraph_loss = self.alpha * loss_c + (1 - self.alpha) * loss_c_hat
 
-        # ---- 7. Node-node contrast ----
-        logits_p = self.p_disc(other_emb, anchor_emb)           # [B*(1+np), 1]
-        logits_p_hat = self.p_disc(other_emb_hat, anchor_emb_hat)
-        loss_p = (self.bce_patch(logits_p, lbl_patch) * pw_patch).mean()
-        loss_p_hat = (self.bce_patch(logits_p_hat, lbl_patch) * pw_patch).mean()
-        node_node_loss = self.alpha * loss_p + (1 - self.alpha) * loss_p_hat
-
-        # ---- 8. Subgraph-subgraph cross-view InfoNCE ----
+        # ---- 7. Subgraph-subgraph cross-view InfoNCE ----
         subgraph_loss = self._nce_loss(context_emb, context_emb_hat, batch_size)
 
-        # ---- 9. Combine ----
+        # ---- 8. Combine three-scale loss ----
         total = (self.beta * node_subgraph_loss +
                  (1 - self.beta) * node_node_loss +
                  self.gamma * subgraph_loss)
