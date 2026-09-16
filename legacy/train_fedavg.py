@@ -1,8 +1,14 @@
 import argparse
+import os
+import sys
 import warnings
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+
+# 仓库根目录 (legacy/train_fedavg.py -> 上一级), 供 import util / model
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from util.task_util import accuracy
 from util.base_util import seed_everything, load_dataset
 from model import GCN
@@ -15,7 +21,7 @@ parser = argparse.ArgumentParser()
 
 # experimental environment setup
 parser.add_argument('--seed', type=int, default=2024)
-parser.add_argument('--root', type=str, default='/home/ai2/work/fedtad/dataset')
+parser.add_argument('--root', type=str, default='./dataset')
 parser.add_argument('--gpu_id', type=str, default='0')
 parser.add_argument('--dataset', type=str, default="Cora")
 parser.add_argument('--partition', type=str, default="Louvain", choices=["Louvain", "Metis"])

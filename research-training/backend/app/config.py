@@ -4,8 +4,8 @@ from pathlib import Path
 
 
 class Settings(BaseSettings):
-    # Database
-    DATABASE_URL: str = "postgresql+asyncpg://fedtad_user:fedtad_password@127.0.0.1:5432/fedtad"
+    # Database (占位默认值; 实际配置来自 backend/.env, 该文件 gitignored)
+    DATABASE_URL: str = "postgresql+asyncpg://fedtad_user:change-me@127.0.0.1:5432/fedtad"
 
     # JWT
     SECRET_KEY: str = "change-this-to-a-random-secret-key-in-production"

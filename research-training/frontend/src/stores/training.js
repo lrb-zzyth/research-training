@@ -4,14 +4,17 @@ import {
   startTraining as startApi,
   stopTraining as stopApi,
   getTrainingStatus,
+  getTrainingUpdates as getUpdatesApi,
 } from '../api'
 
 export const useTrainingStore = defineStore('training', () => {
   const currentExperimentId = ref(null)
   const isRunning = ref(false)
   const logs = ref([])
-  const serverMetrics = ref([])    // global_val, global_test, best_val, best_test
-  const clientMetrics = ref([])    // per-client acc/loss
+  const serverMetrics = ref([])    // global_val/global_test/best_*/generator/distillation/resource
+  const clientMetrics = ref([])    // per-client losses (source: client_<id>)
+  const ckrMetrics = ref([])       // CKR 权重 (source: ckr, name: ckr_c<ci>c<cls>)
+  const paramUpdates = ref([])     // 参数热更新审计记录
 
   const metricsByRound = computed(() => {
     const map = {}
@@ -25,12 +28,36 @@ export const useTrainingStore = defineStore('training', () => {
       .sort((a, b) => a.round - b.round)
   })
 
+  // 最近一轮 CKR 权重矩阵: 按 (client, class) 展开
+  const latestCkrMatrix = computed(() => {
+    const byRound = {}
+    for (const m of ckrMetrics.value) {
+      if (m.round == null) continue
+      if (!byRound[m.round]) byRound[m.round] = []
+      byRound[m.round].push(m)
+    }
+    const rounds = Object.keys(byRound).map(Number)
+    if (!rounds.length) return { round: null, rows: [] }
+    const last = Math.max(...rounds)
+    const rows = []
+    for (const m of byRound[last]) {
+      const mm = /^ckr_c(\d+)c(\d+)$/.exec(m.metric_name)
+      if (mm) {
+        rows.push({ client: Number(mm[1]), cls: Number(mm[2]), value: m.metric_value })
+      }
+    }
+    rows.sort((a, b) => a.client - b.client || a.cls - b.cls)
+    return { round: last, rows }
+  })
+
   function reset() {
     currentExperimentId.value = null
     isRunning.value = false
     logs.value = []
     serverMetrics.value = []
     clientMetrics.value = []
+    ckrMetrics.value = []
+    paramUpdates.value = []
   }
 
   async function start(params) {
@@ -60,6 +87,15 @@ export const useTrainingStore = defineStore('training', () => {
     }
   }
 
+  async function refreshUpdates(experimentId) {
+    try {
+      const res = await getUpdatesApi(experimentId)
+      paramUpdates.value = res.data
+    } catch {
+      paramUpdates.value = []
+    }
+  }
+
   function addLog(line) {
     logs.value.push(line)
   }
@@ -68,6 +104,8 @@ export const useTrainingStore = defineStore('training', () => {
     for (const m of metricsList) {
       if (m.source === 'server' || m.source === 'best') {
         serverMetrics.value.push(m)
+      } else if (m.source === 'ckr') {
+        ckrMetrics.value.push(m)
       } else {
         clientMetrics.value.push(m)
       }
@@ -80,11 +118,15 @@ export const useTrainingStore = defineStore('training', () => {
     logs,
     serverMetrics,
     clientMetrics,
+    ckrMetrics,
+    paramUpdates,
     metricsByRound,
+    latestCkrMatrix,
     reset,
     start,
     stop,
     checkStatus,
+    refreshUpdates,
     addLog,
     addMetrics,
   }

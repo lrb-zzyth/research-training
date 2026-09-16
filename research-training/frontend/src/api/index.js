@@ -74,3 +74,16 @@ export function getExperimentLogs(id, limit = 500) {
 export function getExperimentMetrics(id) {
   return api.get(`/experiments/${id}/metrics`)
 }
+
+export function getExperimentConfig(id) {
+  return api.get(`/experiments/${id}/config`)
+}
+
+// ── 参数热更新 API ────────────────────────────────────────────────────────────
+export function updateTrainingParam(parameter, value) {
+  return api.post('/training/update', { parameter, value })
+}
+
+export function getTrainingUpdates(experimentId) {
+  return api.get('/training/updates', { params: { experiment_id: experimentId } })
+}

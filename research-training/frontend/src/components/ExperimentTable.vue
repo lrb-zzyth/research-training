@@ -11,8 +11,8 @@
       <el-table-column prop="start_time" :label="$t('开始时间（Start Time）')" width="180" />
       <el-table-column prop="end_time" :label="$t('结束时间（End Time）')" width="180" />
       <el-table-column prop="best_round" :label="$t('最优轮次（Best Round）')" width="100" />
-      <el-table-column prop="best_val" :label="$t('最佳验证（Best Val）')" width="100" />
-      <el-table-column prop="best_test" :label="$t('最佳测试（Best Test）')" width="100" />
+      <el-table-column prop="best_val" :label="$t('最佳验证 F1（Best Val F1）')" width="110" />
+      <el-table-column prop="best_test" :label="$t('最佳测试 F1（Best Test F1）')" width="110" />
       <el-table-column :label="$t('操作（Actions）')" width="80" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click="$emit('view', row)">{{ $t('查看（View）') }}</el-button>

@@ -1,0 +1,7 @@
+# FedTAD 核心算法依赖 (Python 3.10, 已验证环境: torch 2.7.1 / torch_geometric 2.6.1)
+torch>=2.0.0
+torch-geometric>=2.4.0
+numpy
+scikit-learn
+networkx
+python-louvain   # 仓库内已 vendored 到 louvain/, 此条目供单独安装时使用

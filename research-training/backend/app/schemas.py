@@ -83,6 +83,15 @@ class ExperimentResponse(BaseModel):
     status: str
     command: str
     parameters: dict
+    # 平台集成: 配置快照与任务生命周期
+    # (Optional: 兼容迁移前的历史记录)
+    canonical_config: Optional[dict] = None
+    git_commit: Optional[str] = None
+    environment: Optional[dict] = None
+    task_dir: Optional[str] = None
+    last_round: Optional[int] = None
+    exit_code: Optional[int] = None
+    error_tail: Optional[str] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     best_round: Optional[int] = None
@@ -117,6 +126,30 @@ class TrainingMetricResponse(BaseModel):
     metric_value: float
     source: str
     created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ── 参数热更新 ────────────────────────────────────────────────────────────────
+
+class ParameterUpdateRequest(BaseModel):
+    parameter: str
+    value: object = None
+
+
+class ParameterUpdateResponse(BaseModel):
+    id: int
+    experiment_id: int
+    request_id: str = ""
+    parameter: str
+    old_value: Optional[object] = None
+    new_value: object = None
+    effective_round: Optional[int] = None
+    status: str = "pending"
+    reason: Optional[str] = None
+    created_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

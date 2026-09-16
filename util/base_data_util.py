@@ -37,10 +37,13 @@ def idx_to_mask(index, size):
     return mask
 
 
-def louvain_partition(graph, num_clients, delta=20):
+def louvain_partition(graph, num_clients, delta=20, return_groups=False,
+                      louvain_seed=2024):
     num_nodes = graph.number_of_nodes()
 
-    partition = community_louvain.best_partition(graph)
+    # 固定 Louvain 随机种子: 保证划分可复现 (python-louvain 默认不固定 RNG)
+    # 注意: 磁盘缓存(natural)保持旧划分不变; 新缓存目录(如 enriched)使用固定种子
+    partition = community_louvain.best_partition(graph, random_state=louvain_seed)
 
     groups = []
 
@@ -112,20 +115,170 @@ def louvain_partition(graph, num_clients, delta=20):
     node_dict = owner_node_ids
 
     print("end louvain")
+    if return_groups:
+        groups = [list(partition_groups[g]) for g in groups]
+        return node_dict, groups
     return node_dict
 
 
-def data_partition(G, num_clients, train, val, test, partition, part_delta):
+def enrich_anomaly_support(node_dict, groups, y, anomaly_classes, target,
+                           num_clients, delta=20, seed=0):
+    """
+    受控支持度划分 (anomaly_enriched_partition, 仅机制实验):
+    在不复制节点、不修改标签、不产生跨客户端重复的前提下,
+    通过移动整个 Louvain 社区使更多客户端达到最小异常节点数 target。
+
+    规则:
+      - 只移动完整社区 (不拆分)
+      - 移动后: 接收方大小 <= floor(N/K) + 2*delta, 来源方大小 >= floor(N/K) - 2*delta
+      - 确定性: 客户端/社区顺序由 seed 控制的 RNG 决定
+      - 记录每次移动
+
+    Returns:
+        (new_node_dict, moves)  moves: list of dict
+    """
+    import random as _random
+    rng = _random.Random(int(seed))
+    N = sum(len(nodes) for nodes in node_dict.values())
+    floor_size = N // num_clients
+
+    y_arr = y.cpu().numpy() if hasattr(y, 'cpu') else y
+    anom_set = set(anomaly_classes)
+    group_owner = {}
+    group_anom = {}
+    for gi, nodes in enumerate(groups):
+        group_anom[gi] = sum(1 for n in nodes if int(y_arr[n]) in anom_set)
+
+    def client_anom(ci):
+        return sum(1 for n in node_dict[ci] if int(y_arr[n]) in anom_set)
+
+    def owner_of(gi):
+        for cj, nodes_c in node_dict.items():
+            if any(n in nodes_c for n in groups[gi][:1]):
+                return cj
+        return None
+
+    def move_group(gi, to_ci, from_r):
+        for n in groups[gi]:
+            node_dict[to_ci].append(n)
+            node_dict[from_r].remove(n)
+        moved_groups.add(gi)
+
+    moves = []
+    moved_groups = set()
+    size_hi = floor_size + 4 * delta  # 接收方容量上限
+    size_lo = floor_size - 4 * delta  # 来源方容量下限
+    for iter_ in range(300):
+        deficit = [(ci, client_anom(ci)) for ci in range(num_clients)
+                   if client_anom(ci) < target]
+        if not deficit:
+            break
+        deficit.sort(key=lambda x: x[1])
+        ci = deficit[0][0]  # 确定性: 始终服务最不足的客户端
+        room = size_hi - len(node_dict[ci])
+
+        # 1) 直接移动: 小组放进接收方剩余容量
+        candidates = []
+        for gi, nodes in enumerate(groups):
+            if gi in moved_groups or group_anom[gi] <= 0:
+                continue
+            r = owner_of(gi)
+            if r is None or r == ci:
+                continue
+            if client_anom(r) - group_anom[gi] < target:
+                continue  # 来源方移后跌破 target
+            sz_g = len(nodes)
+            if sz_g <= room and len(node_dict[r]) - sz_g >= size_lo:
+                candidates.append((group_anom[gi], sz_g, gi, r))
+        if candidates:
+            rng.shuffle(candidates)
+            candidates.sort(key=lambda x: (-x[0], x[1]))
+            _, sz_g, gi, r = candidates[0]
+            move_group(gi, ci, r)
+            moves.append({'type': 'move', 'group_id': gi, 'from_client': r,
+                          'to_client': ci, 'group_size': sz_g,
+                          'anomalies': group_anom[gi]})
+            continue
+
+        # 2) 交换: 大异常组与接收方的大非异常组互换 (尺寸守恒, 集中异常)
+        swaps = []
+        for gi, nodes in enumerate(groups):
+            if gi in moved_groups or group_anom[gi] <= 0:
+                continue
+            r = owner_of(gi)
+            if r is None or r == ci:
+                continue
+            if client_anom(r) - group_anom[gi] < target:
+                continue
+            sz_a = len(nodes)
+            for gj, nodes_b in enumerate(groups):
+                if gj in moved_groups or gj == gi:
+                    continue
+                if owner_of(gj) != ci:
+                    continue
+                sz_b = len(nodes_b)
+                gain = group_anom[gi] - group_anom[gj]
+                if gain <= 0:
+                    continue
+                if abs(sz_a - sz_b) > 2 * delta:  # 尺寸接近才交换
+                    continue
+                if (len(node_dict[r]) - sz_a + sz_b >= size_lo
+                        and len(node_dict[r]) - sz_a + sz_b <= size_hi
+                        and len(node_dict[ci]) - sz_b + sz_a <= size_hi):
+                    swaps.append((gain, sz_a, gi, gj, r))
+        if swaps:
+            rng.shuffle(swaps)
+            swaps.sort(key=lambda x: (-x[0], x[1]))
+            _, sz_a, gi, gj, r = swaps[0]
+            move_group(gi, ci, r)
+            move_group(gj, r, ci)
+            moves.append({'type': 'swap', 'group_id': gi, 'pair_group_id': gj,
+                          'from_client': r, 'to_client': ci,
+                          'group_size': sz_a, 'pair_group_size': len(groups[gj]),
+                          'anomalies': group_anom[gi],
+                          'anomalies_received_back': group_anom[gj]})
+            continue
+        break
+    return node_dict, moves
+
+
+def data_partition(G, num_clients, train, val, test, partition, part_delta,
+                   support_mode='natural', anomaly_classes=None,
+                   anomaly_partition_target=0, support_rebalance_seed=0,
+                   min_train_support=0, partition_seed=None,
+                   return_node_dict=False):
+    """
+    support_mode:
+      natural                : 原始 Louvain 划分 (默认)
+      anomaly_enriched       : 受控支持度划分 (仅机制实验, 移动完整社区)
+    partition_seed: Louvain 随机种子 (None=用固定默认 2024)
+    """
     time_st = time.time()
     print("start g to nxg")
     graph_nx = to_networkx(G, to_undirected=True, remove_self_loops=True)
     print(f"get nxg {time.time()-time_st} sec.")
 
+    partition_moves = []
     if partition == "Louvain":
         print("Conducting louvain graph partition...")
-        node_dict = louvain_partition(
-            graph=graph_nx, num_clients=num_clients, delta=part_delta
-        )
+        louvain_seed = partition_seed if partition_seed is not None else 2024
+        if support_mode == 'anomaly_enriched':
+            assert anomaly_classes, "anomaly_enriched 需要 anomaly_classes"
+            assert anomaly_partition_target > 0, "anomaly_enriched 需要 anomaly_partition_target > 0"
+            node_dict, groups = louvain_partition(
+                graph=graph_nx, num_clients=num_clients, delta=part_delta,
+                return_groups=True, louvain_seed=louvain_seed)
+            node_dict, partition_moves = enrich_anomaly_support(
+                node_dict, groups, G.y, anomaly_classes,
+                target=anomaly_partition_target,
+                num_clients=num_clients, delta=part_delta,
+                seed=support_rebalance_seed)
+            # 持久化社区移动记录 (FGLDataset.process 写入 moves.json)
+            G.partition_moves = partition_moves
+        else:
+            node_dict = louvain_partition(
+                graph=graph_nx, num_clients=num_clients, delta=part_delta,
+                louvain_seed=louvain_seed)
     elif partition == "Metis":
         # import metispy as metis
         import metis
@@ -158,6 +311,8 @@ def data_partition(G, num_clients, train, val, test, partition, part_delta):
     G.num_samples = 0
     for subgraph in subgraph_list:
         G.num_samples += subgraph.num_samples
+    if return_node_dict:
+        return subgraph_list, node_dict
     return subgraph_list
 
 

@@ -11,9 +11,11 @@ venv/
 env/
 *.egg-info/
 
-# IDE
+# IDE / 本地工具
 .vscode/
 .idea/
+.claude/
+*.local
 
 # Logs and outputs
 *.log
@@ -51,3 +53,17 @@ dist/
 **/.env.*
 !**/.env.example
 references/
+
+# 本地个人材料（不进入远程仓库）
+presentation/
+*.docx
+
+# 数据集：仓库仅分发 Cora + Louvain(10 客户端) 基线子图
+# 其余切分变体由划分脚本按需重新生成，避免仓库膨胀
+dataset/CiteSeer/
+dataset/Cora/Client2/
+dataset/Cora/Client*/Louvain_enriched*/
+dataset/Cora/Client*/Louvain_frozen*/
+
+# 静态 CKR 磁盘缓存（运行时生成）
+ckr/
