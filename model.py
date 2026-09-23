@@ -125,6 +125,32 @@ class ConditionalDiffusionGenerator(nn.Module):
         h = torch.cat([x_t, t_emb, c_emb], dim=-1)              # [B, F+H+H]
         return self.net(h)
 
+    def denoise_loss(self, x0, labels, t=None, reduce='mean'):
+        """
+        标准 DDPM 训练目标 —— 专利 S3.1 / S3.2 的前向加噪 + 噪声预测。
+
+            S3.1 前向:  q(x_t | x_0) = N(x_t; √(ᾱ_t)·x_0, (1−ᾱ_t)·I)
+            S3.2 损失:  L = E_{x_0,ε,t}[ ‖ε − ε_θ(x_t, t, c)‖² ]
+                        "即预测并去除每一步所添加的噪声"
+
+        Args:
+            x0:     [B, F] **真实**节点特征 (来自客户端本地数据, 不出域)
+            labels: [B]    这些节点的类别标签 (条件 c)
+            t:      [B]    可选, 指定时间步; 默认均匀随机采样
+        Returns:
+            标量损失
+        """
+        B = x0.shape[0]
+        if t is None:
+            t = torch.randint(0, self.num_steps, (B,), device=x0.device)
+        eps = torch.randn_like(x0)
+        alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)          # [B,1]
+        x_t = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1.0 - alpha_bar_t) * eps
+        # 注意: 这里必须用未加 output_bound 的原始输出 —— 预测的是噪声(可正可负、量级~1),
+        # 若过 tanh 会被夹死, 去噪任务无法学习
+        eps_pred = self.forward(x_t, t, labels)
+        return torch.nn.functional.mse_loss(eps_pred, eps, reduction=reduce)
+
     def _apply_output_bound(self, x):
         """应用输出边界约束，防止纯噪声起步时数值爆炸。"""
         if self.output_bound == 'tanh':

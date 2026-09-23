@@ -137,7 +137,7 @@ CANONICAL_SCHEMA: dict[str, dict] = {
                                "group": "contrastive", "hot_update_policy": "start",
                                "requires_restart": True, "effective_stage": "before_task",
                                "description": "对比锚点批大小"},
-    "contrastive_temperature": {"type": "float", "default": 0.5, "min": 1e-3, "max": 10.0,
+    "contrastive_temperature": {"type": "float", "default": 0.2, "min": 1e-3, "max": 10.0,
                                 "group": "contrastive", "hot_update_policy": "round_boundary",
                                 "requires_restart": False, "effective_stage": "next_round",
                                 "description": "InfoNCE 温度 (轮次边界热更新)"},
@@ -211,7 +211,7 @@ CANONICAL_SCHEMA: dict[str, dict] = {
                        "group": "generator", "hot_update_policy": "start",
                        "requires_restart": True, "effective_stage": "before_task",
                        "description": "生成器初始化 (scratch=核心)"},
-    "diffusion_steps": {"type": "int", "default": 10, "min": 1, "max": 1000,
+    "diffusion_steps": {"type": "int", "default": 20, "min": 1, "max": 1000,
                         "group": "generator", "hot_update_policy": "start",
                         "requires_restart": True, "effective_stage": "before_task",
                         "description": "扩散采样步数 (生成器结构, 重启生效)"},
@@ -223,7 +223,7 @@ CANONICAL_SCHEMA: dict[str, dict] = {
                              "group": "generator", "hot_update_policy": "start",
                              "requires_restart": True, "effective_stage": "before_task",
                              "description": "噪声调度 beta 起始 (重启生效)"},
-    "diffusion_beta_end": {"type": "float", "default": 0.02, "min": 1e-3, "max": 1.0,
+    "diffusion_beta_end": {"type": "float", "default": 0.5, "min": 1e-3, "max": 1.0,
                            "group": "generator", "hot_update_policy": "start",
                            "requires_restart": True, "effective_stage": "before_task",
                            "description": "噪声调度 beta 终止 (重启生效)"},
@@ -279,7 +279,7 @@ CANONICAL_SCHEMA: dict[str, dict] = {
                          "group": "generator", "hot_update_policy": "round_boundary",
                          "requires_restart": False, "effective_stage": "next_round",
                          "description": "多样性损失权重 (轮次边界热更新)"},
-    "lambda_feature_norm": {"type": "float", "default": 1e-3, "min": 0.0, "max": 100.0,
+    "lambda_feature_norm": {"type": "float", "default": 0.0, "min": 0.0, "max": 100.0,
                             "group": "generator", "hot_update_policy": "round_boundary",
                             "requires_restart": False, "effective_stage": "next_round",
                             "description": "特征范数权重 (轮次边界热更新)"},
@@ -339,7 +339,48 @@ CANONICAL_SCHEMA: dict[str, dict] = {
     "resplit_stratified": {"type": "bool", "default": True, "group": "task",
                            "hot_update_policy": "start", "requires_restart": True,
                            "effective_stage": "before_task",
-                           "description": "标签映射后分层重划分"},
+                           "description": "标签映射后分层重划分。⚠️ 本平台默认 task_mode="
+                                          "anomaly_binary 时为 True; 切到 multiclass 时训练端会"
+                                          "自动置 False(2026-09-21 实测: 重切分会丢弃缓存的作者划分, "
+                                          "使 Cora-10 FedAvg 从 74.2 虚高到 77.2、跨种子 std 从 ±0.3 "
+                                          "放大到 ±1.5, 数字不可与论文对照)"},
+    # ---- 蒸馏/扩散新增 (2026-09-21 算法主线更新后同步) ----
+    "distill_loss_type": {"type": "str", "default": "kl", "choices": ["kl", "l1"],
+                          "group": "distillation", "hot_update_policy": "start",
+                          "requires_restart": True, "effective_stage": "before_task",
+                          "description": "蒸馏/分歧损失形式。kl = 本方法设计(专利权6 / 专利书 S4.2, "
+                                         "亦与 FedTAD 论文 Eq.10 一致); l1 = 上游参考代码的写法。"
+                                         "二者梯度性质不同, 非等价变形"},
+    "federated_diffusion_pretrain": {"type": "bool", "default": True,
+                                     "group": "distillation",
+                                     "hot_update_policy": "start",
+                                     "requires_restart": True,
+                                     "effective_stage": "before_task",
+                                     "description": "联邦扩散预训练 (专利 S3.1/S3.2 + 专利权1)。"
+                                                    "各客户端本地用自己的真实特征做前向加噪并训练噪声预测, "
+                                                    "只上传去噪网络参数, 原始特征不出域"},
+    "diffusion_pretrain_rounds": {"type": "int", "default": 10, "min": 1, "max": 200,
+                                  "group": "distillation", "hot_update_policy": "start",
+                                  "requires_restart": True, "effective_stage": "before_task",
+                                  "description": "联邦扩散预训练的联邦轮数"},
+    "diffusion_pretrain_epochs": {"type": "int", "default": 30, "min": 1, "max": 500,
+                                  "group": "distillation", "hot_update_policy": "start",
+                                  "requires_restart": True, "effective_stage": "before_task",
+                                  "description": "扩散预训练每客户端本地 epoch 数"},
+    "diffusion_pretrain_batch": {"type": "int", "default": 256, "min": 2, "max": 8192,
+                                 "group": "distillation", "hot_update_policy": "start",
+                                 "requires_restart": True, "effective_stage": "before_task",
+                                 "description": "扩散预训练批大小"},
+    "diffusion_pretrain_lr": {"type": "float", "default": 1e-3, "min": 1e-6, "max": 1.0,
+                              "group": "distillation", "hot_update_policy": "start",
+                              "requires_restart": True, "effective_stage": "before_task",
+                              "description": "扩散预训练学习率"},
+    "feature_stats_align": {"type": "bool", "default": False,
+                            "group": "distillation", "hot_update_policy": "start",
+                            "requires_restart": True, "effective_stage": "before_task",
+                            "description": "[实验性] 特征统计特性对齐。客户端上传统计量(非原始特征), "
+                                           "服务端把伪特征重标定到真实统计特性。实测能精确对齐 σ "
+                                           "但会令生成器梯度塌缩, 默认关闭"},
 }
 
 # 平台内部字段 (不进入训练命令行)
@@ -477,11 +518,15 @@ COMMAND_FIELDS = [
     "fake_nodes", "fake_class_strategy", "generator_warmup_rounds",
     "generator_steps", "generator_lr", "lambda_sem", "lambda_disagreement",
     "lambda_diversity", "lambda_feature_norm", "knn_k",
-    "distill_steps", "distill_lr", "distill_temperature",
+    "distill_steps", "distill_lr", "distill_temperature", "distill_loss_type",
+    "federated_diffusion_pretrain", "diffusion_pretrain_rounds",
+    "diffusion_pretrain_epochs", "diffusion_pretrain_batch",
+    "diffusion_pretrain_lr", "feature_stats_align",
     "checkpoint_dir", "resume_checkpoint", "save_last_checkpoint",
     "selection_metric", "f1_threshold", "auc_threshold",
     "allow_anomaly_majority", "resplit_stratified",
 ]
 
 # BooleanOptionalAction 参数 (False 时传 --no- 形式)
-BOOLEAN_OPTIONAL = {"use_weighted_ce", "save_last_checkpoint", "resplit_stratified"}
+BOOLEAN_OPTIONAL = {"use_weighted_ce", "save_last_checkpoint", "resplit_stratified",
+                    "federated_diffusion_pretrain", "feature_stats_align"}

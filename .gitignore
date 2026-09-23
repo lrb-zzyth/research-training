@@ -67,3 +67,12 @@ dataset/Cora/Client*/Louvain_frozen*/
 
 # 静态 CKR 磁盘缓存（运行时生成）
 ckr/
+
+# 非 Cora 数据集的原始/处理数据 (公开可下载, 体积大; 按既有边界规则不外发)
+# 划分记录 node_assignments.json 仍保留分发, 便于复现划分
+dataset/CS/raw/
+dataset/CS/processed/
+dataset/Physics/raw/
+dataset/Physics/processed/
+dataset/PubMed/raw/
+dataset/PubMed/processed/

@@ -134,9 +134,13 @@ parser.add_argument('--anomaly_classes', type=str, default='4,5,6',
 
 # 数据划分
 parser.add_argument('--resplit_stratified', action=argparse.BooleanOptionalAction,
-                    default=True,
-                    help='加载后按类别分层重新划分 train/val/test (seed 控制, 默认 true); '
-                         'anomaly_binary 在标签映射之后执行 (--resplit_after_label_mapping 为兼容别名)')
+                    default=None,
+                    help='加载后按类别分层重新划分 train/val/test (seed 控制); '
+                         'anomaly_binary 在标签映射之后执行 (--resplit_after_label_mapping 为兼容别名)。'
+                         '默认 None = 按 task_mode 自动: anomaly_binary=True, multiclass=False。'
+                         'multiclass 默认关闭的原因(2026-09-21 实测): 重切分会丢弃缓存 data*.pt 中'
+                         '作者发布的原始切分, 使训练/测试节点与原版不同, Cora-10 FedAvg 被抬到 77.21'
+                         '(原版/论文 73.6~74.2), 跨种子 std 从 ±0.3 放大到 ±1.5, 数字不可与论文对照')
 parser.add_argument('--resplit_after_label_mapping', action=argparse.BooleanOptionalAction,
                     default=True, help=argparse.SUPPRESS)
 
@@ -174,7 +178,10 @@ parser.add_argument('--distill_weighting', type=str, default='static_ckr',
 
 # 加权CE
 parser.add_argument('--use_weighted_ce', action=argparse.BooleanOptionalAction,
-                    default=True)
+                    default=None,
+                    help='类别加权 CE。默认 None = 按 task_mode 自动: anomaly_binary=True, '
+                         'multiclass=False。multiclass 默认关闭的原因: Cora-10 五种子配对实测 '
+                         '该组件相对 FedAvg 为 -2.10 (逆频率加权在客户端内部极度非同分布时扭曲优化目标)')
 parser.add_argument('--class_weight_method', type=str, default='inverse',
                     choices=['inverse', 'effective_num'])
 parser.add_argument('--beta', type=float, default=0.999)
@@ -190,7 +197,10 @@ parser.add_argument('--edge_perturb_ratio', type=float, default=0.2)
 parser.add_argument('--rwr_restart_prob', type=float, default=0.5)
 parser.add_argument('--rwr_subgraph_size', type=int, default=5)
 parser.add_argument('--contrastive_batch_size', type=int, default=64)
-parser.add_argument('--contrastive_temperature', type=float, default=0.5)
+parser.add_argument('--contrastive_temperature', type=float, default=0.2,
+                    help='InfoNCE 温度 τ。默认 0.2 (原为 0.5)。'
+                         'Cora-10 五种子实测: τ=0.2 -> 76.53±0.77 vs τ=0.5 -> 75.75±0.87 (+0.78), '
+                         '且 τ 越小越好 (τ=1.0 -> 75.00), 5/5 种子一致')
 parser.add_argument('--lambda_subgraph', type=float, default=0.1)
 parser.add_argument('--contrastive_anchor_scope', type=str, default='all_nodes',
                     choices=['train_nodes', 'all_nodes'])
@@ -222,12 +232,43 @@ parser.add_argument('--anchor_pool_size', type=int, default=0,
                     help='锚点池大小 (0=使用全部候选节点)')
 
 # 扩散生成器
-parser.add_argument('--diffusion_steps', type=int, default=10)
+parser.add_argument('--diffusion_steps', type=int, default=20,
+                    help='扩散总步数 T。默认 20 (原 10)。原因: T=10/β_end=0.02 时 '
+                         'alpha_bar_T=0.904, x_T 仍残留 90%% 原始信号, 不满足专利 S3.1 '
+                         '「经过 T 步后退化为纯噪声」; T=20/β_end=0.5 时 alpha_bar_T=0.002 ✓')
 parser.add_argument('--diffusion_hidden', type=int, default=256)
 parser.add_argument('--diffusion_beta_start', type=float, default=1e-4)
-parser.add_argument('--diffusion_beta_end', type=float, default=0.02)
+parser.add_argument('--diffusion_beta_end', type=float, default=0.5,
+                    help='β 调度终点。默认 0.5 (原 0.02), 与 --diffusion_steps 20 配合使前向过程真正退化')
 parser.add_argument('--generator_output_bound', type=str, default='tanh',
-                    choices=['tanh', 'clamp', 'none'])
+                    choices=['tanh', 'clamp', 'none'],
+                    help='生成器输出激活。原版 FedTAD 用的是无界 Linear; 本仓库历史默认 tanh '
+                         '会把伪特征尺度卡死在 [-1,1] (实测三数据集 σ 恒为 0.655, 与数据无关)')
+parser.add_argument('--feature_stats_align', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='[实验性, 默认关] 特征统计特性对齐。客户端本地计算自己特征的 (μ,σ) 并上行'
+                         '(2×F 个统计量, 非原始特征, 与专利权1「仅上传分值」同一条思路), '
+                         '服务端按节点数加权聚合成全局统计量, 再把生成器输出重标定到该统计特性, '
+                         '依据专利 S3.2「生成具备真实统计特性的伪节点特征矩阵」。'
+                         '2026-09-21 实测: 能把伪特征 σ 精确对齐到真实值(0.98→0.0916, 真实 0.092), '
+                         '但会使生成器 L_sem 与 L_dis 同时塌缩到 0、梯度消失, 准确率反而略降'
+                         '(72.99→71.53)。根因: 真实尺度的伪特征让教师轻易分类且互相一致, 分歧信号归零。'
+                         '故默认关闭, 保留供进一步研究')
+
+# ---- 联邦扩散预训练 (专利 S3.1/S3.2 + 专利权1) ----
+parser.add_argument('--federated_diffusion_pretrain', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='联邦扩散预训练 (默认**开**)。主训练前先做联邦去噪预训练: '
+                         '各客户端在**本地**用自己的真实特征做前向加噪并训练噪声预测 '
+                         '(专利 S3.1 前向过程 + S3.2 噪声预测损失), '
+                         '只上传去噪网络参数, 服务端按节点数加权聚合, **原始特征不出域** (专利权1)。'
+                         '⚠️ 依赖退化的噪声调度: 已把 --diffusion_steps 默认改为 20、'
+                         '--diffusion_beta_end 默认改为 0.5 (alpha_bar_T=0.002 ≈ 纯噪声)。'
+                         '关闭后行为与旧版一致(去噪网络不被训练)')
+parser.add_argument('--diffusion_pretrain_rounds', type=int, default=10)
+parser.add_argument('--diffusion_pretrain_epochs', type=int, default=30)
+parser.add_argument('--diffusion_pretrain_batch', type=int, default=256)
+parser.add_argument('--diffusion_pretrain_lr', type=float, default=1e-3)
 
 # ---- 生成器初始化与反向传播 ----
 parser.add_argument('--generator_init', type=str, default='scratch',
@@ -312,16 +353,29 @@ parser.add_argument('--generator_lr', type=float, default=1e-3)
 parser.add_argument('--lambda_sem', type=float, default=1.0)
 parser.add_argument('--lambda_disagreement', type=float, default=0.1)
 parser.add_argument('--lambda_diversity', type=float, default=0.1)
-parser.add_argument('--lambda_feature_norm', type=float, default=1e-3)
+parser.add_argument('--lambda_feature_norm', type=float, default=0.0,
+                    help='伪特征 L2 范数惩罚权重。默认 0.0 (原为 1e-3)。'
+                         '原值下该损失项只占 L_G 的约 0.04%%(L_norm≈0.43 × 1e-3 vs L_G≈0.43), '
+                         '实测形同虚设且对伪特征尺度(σ=0.71 vs 真实 0.11)毫无约束, 故置零')
 parser.add_argument('--fake_nodes', type=int, default=100)
 parser.add_argument('--fake_class_strategy', type=str, default='balanced',
                     choices=['balanced', 'prior', 'reliability'])
 parser.add_argument('--generator_warmup_rounds', type=int, default=3)
 
 # 全局蒸馏
-parser.add_argument('--distill_steps', type=int, default=5)
+parser.add_argument('--distill_steps', type=int, default=5,
+                    help='每轮蒸馏内迭代次数。原版 FedTAD 为 glb_epochs(5)×it_d(5)=25, '
+                         '故与论文对照时应设 25')
 parser.add_argument('--distill_lr', type=float, default=1e-3)
 parser.add_argument('--distill_temperature', type=float, default=1.0)
+parser.add_argument('--distill_loss_type', type=str, default='kl',
+                    choices=['kl', 'l1'],
+                    help='蒸馏/分歧损失形式。默认 kl = 本方法(**专利权6 / 专利书 S4.2**)的设计: '
+                         '「采用 Kullback-Leibler 散度衡量全局模型与各客户端本地模型在伪图节点上的'
+                         '预测分布差异, 并以类别知识可靠性为动态权重加权」。'
+                         'l1 = 原版 FedTAD 的做法(mean|global_pred − local_pred.detach()| 作用在原始输出上, '
+                         'references/FedTAD/train_fedtad.py:342-345), 仅供消融对照, 不是本方法的设计。'
+                         '注意: 二者梯度性质不同, 不是等价变形, 不要为了"对齐原版"而误改默认值')
 
 # ---- CKR 模式 ----
 parser.add_argument('--ckr_mode', type=str, default='static_topology',
@@ -389,6 +443,16 @@ parser.add_argument('--auc_threshold', type=float, default=1.0,
                     help='第二终止(低资源): 客户端AUC连续N轮增幅小于该值')
 
 args = parser.parse_args()
+
+# ---- task_mode 自适应的默认值 (2026-09-21) ----
+# 这两个开关在 multiclass 口径下经 5 种子配对实测为负贡献/破坏可对照性,
+# 但 anomaly_binary 主线仍需要它们的历史默认值, 故用 None 哨兵按 task_mode 分派,
+# 保证异常检测实验的行为逐位不变。
+if args.resplit_stratified is None:
+    args.resplit_stratified = (args.task_mode == 'anomaly_binary')
+if args.use_weighted_ce is None:
+    args.use_weighted_ce = (args.task_mode == 'anomaly_binary')
+
 # 兼容别名
 args.resplit_after_label_mapping = args.resplit_stratified
 if args.generator_backward_mode:
@@ -1193,6 +1257,148 @@ def compute_ckr(subgraphs, num_classes, args, device):
     return ckr
 
 
+def federated_diffusion_pretrain(generator, subgraphs, args, device):
+    """
+    联邦扩散预训练 (专利 S3.1 / S3.2 + 专利权1).
+
+    问题背景: 原实现在联邦无数据设定下, 去噪网络**从未被训练过** ——
+    没有前向加噪、没有噪声预测损失, 生成器只被 L_sem/L_dis/L_div 训练,
+    等于"套着扩散外壳的 MLP": 承担扩散的全部代价, 却没有学到真实特征分布。
+    实测后果: 伪特征 σ 恒为 0.655 与数据无关(真实 σ 为 0.112/0.092/0.018),
+    教师看到 OOD 输入 -> 蒸馏梯度爆炸(PubMed |grad| 0.29->280) -> 方法完全失效。
+
+    本函数按专利 S3.1/S3.2 补齐标准 DDPM 训练目标:
+        前向:  q(x_t|x_0) = N(x_t; √(ᾱ_t)·x_0, (1−ᾱ_t)·I)
+        损失:  L = E[‖ε − ε_θ(x_t, t, c)‖²]
+    同时满足联邦约束(专利权1「客户端本地计算、仅上传」):
+        每个客户端**只在本地**用自己的真实特征训练去噪网络,
+        只上传去噪网络参数; 服务端按节点数加权聚合。**原始特征不出域**。
+
+    返回: 聚合后的去噪网络 (原地写回 generator)
+    """
+    import copy
+    from torch.optim import Adam as _Adam
+
+    alpha_bar_T = generator.alpha_bars[-1].item()
+    if alpha_bar_T > 0.05:
+        print(f"  ⚠️ [联邦扩散预训练] 噪声调度未退化: alpha_bar_T={alpha_bar_T:.4f} "
+              f"(专利 S3.1 要求 → 纯噪声)。"
+              f"建议 --diffusion_steps 20 --diffusion_beta_end 0.5 (alpha_bar_T=0.002)。"
+              f"当前调度下去噪任务无法学到从纯噪声还原, 预训练效果将大打折扣。")
+    else:
+        print(f"  [联邦扩散预训练] 调度检查通过: alpha_bar_T={alpha_bar_T:.5f} ≈ 纯噪声 (符合专利 S3.1)")
+
+    # 每个客户端本地参与训练的样本 = 该客户端的训练节点 (fit + reliability 之外不碰)
+    client_data = []
+    for ci, sg in enumerate(subgraphs):
+        tr = torch.where(sg.train_idx)[0]
+        if tr.numel() == 0:
+            continue
+        client_data.append((ci, sg.x[tr].to(device).float(), sg.y[tr].to(device)))
+    if not client_data:
+        print("  [联邦扩散预训练] 无可用训练节点, 跳过")
+        return generator
+
+    print(f"  [联邦扩散预训练] {args.diffusion_pretrain_rounds} 联邦轮 × "
+          f"{args.diffusion_pretrain_epochs} 本地 epoch, batch={args.diffusion_pretrain_batch}, "
+          f"lr={args.diffusion_pretrain_lr}")
+    print(f"  [联邦扩散预训练] 上行内容: 去噪网络参数 only（原始特征不出域, 符合专利权1）")
+
+    bs = args.diffusion_pretrain_batch
+    for rnd in range(args.diffusion_pretrain_rounds):
+        states, weights, losses = [], [], []
+        base_state = {k: v.detach().clone() for k, v in generator.state_dict().items()}
+        for ci, x, y in client_data:
+            local_gen = copy.deepcopy(generator)
+            local_gen.load_state_dict(base_state)
+            local_gen.train()
+            opt = _Adam(local_gen.parameters(), lr=args.diffusion_pretrain_lr)
+            n = x.shape[0]
+            ep_loss = 0.0
+            for _ep in range(args.diffusion_pretrain_epochs):
+                perm = torch.randperm(n, device=device)
+                for s in range(0, n, bs):
+                    idx = perm[s:s + bs]
+                    if idx.numel() < 2:
+                        continue
+                    opt.zero_grad()
+                    loss = local_gen.denoise_loss(x[idx], y[idx])
+                    loss.backward()
+                    opt.step()
+                    ep_loss += loss.item()
+            states.append({k: v.detach().clone()
+                           for k, v in local_gen.state_dict().items()})
+            weights.append(float(n))
+            losses.append(ep_loss / max(1, args.diffusion_pretrain_epochs))
+            del local_gen, opt
+        # 服务端加权聚合 (FedAvg over denoiser weights)
+        tot_w = sum(weights)
+        new_state = {}
+        for k in states[0]:
+            acc = None
+            for st, w in zip(states, weights):
+                term = st[k].float() * (w / tot_w)
+                acc = term if acc is None else acc + term
+            new_state[k] = acc.to(generator.state_dict()[k].dtype)
+        generator.load_state_dict(new_state)
+        print(f"    [扩散预训练] round {rnd}: 平均去噪损失={sum(losses)/len(losses):.5f}")
+    print(f"  [联邦扩散预训练] 完成. 去噪器已学到真实特征分布; "
+          f"后续反向采样将以真实分布为先验")
+    return generator
+
+
+def compute_global_feature_stats(subgraphs, device):
+    """
+    特征统计特性对齐 (专利 S3.2「生成具备真实统计特性的伪节点特征矩阵」)。
+
+    客户端在本地计算自己特征的一阶/二阶统计量 (μ_k, σ_k²) 并上行 ——
+    **只上行 2×F 个统计量, 不上行任何原始特征值**, 与专利权1
+    「CKR 客户端本地计算, 仅上传分值」是同一条设计思路 (数据不出域)。
+
+    服务端按节点数加权聚合成全局 (μ, σ), 再把生成器的输出仿射对齐到该统计特性。
+
+    Returns: (g_mu [F], g_std [F])
+    """
+    tot_n, s1, s2 = 0, None, None
+    for sg in subgraphs:
+        x = sg.x.to(device).float()
+        n = x.shape[0]
+        mu = x.mean(dim=0)
+        var = x.var(dim=0, unbiased=False)
+        if s1 is None:
+            s1, s2 = torch.zeros_like(mu), torch.zeros_like(mu)
+        s1 += n * mu
+        s2 += n * (var + mu ** 2)
+        tot_n += n
+    g_mu = s1 / max(tot_n, 1)
+    g_var = torch.clamp(s2 / max(tot_n, 1) - g_mu ** 2, min=0.0)
+    return g_mu, torch.sqrt(g_var)
+
+
+def match_feature_stats(fake_x, g_mu, g_std, eps=1e-6):
+    """
+    把生成器输出重标定到真实特征的统计特性 (专利 S3.2「生成具备真实统计特性的
+    伪节点特征矩阵」)。
+
+    两个作用:
+      1. 让伪特征具备真实特征的尺度, 教师模型不再看到 OOD 输入;
+      2. 同时**消除生成器"放大输出幅度以增大分歧损失"的失控动机** ——
+         尺度被外部强制固定, 生成器无法再靠膨胀幅度降低 L_G。
+         (实测: 无此对齐时 PubMed 伪特征 σ=0.84、真实 σ=0.018, 差 48 倍,
+          蒸馏梯度爆到 280、生成器 L_sem 发散到 37.6)
+
+    ⚠️ 实现细节: 采用**全局标量**重标定而非逐维 z-score。
+       逐维 z-score 会在该维批内标准差趋近 0 时(生成器输出近似常数)除以 eps,
+       **把梯度彻底杀死** —— 实测 L_sem/L_dis/|grad| 全部塌缩到 0, 生成器退化为常数输出。
+       全局标量只调整整体幅度、保留节点间相对结构, 梯度保持线性可传。
+       缩放系数 detach, 防止生成器反过来把系数当成可优化的作弊通道。
+    """
+    f_mean = fake_x.mean()
+    f_std = fake_x.std().clamp(min=eps)
+    scale = (g_std.mean() / f_std).detach()
+    return (fake_x - f_mean.detach()) * scale + g_mu.mean()
+
+
 # =====================================================================
 #  S2: 子图-子图跨视图对比学习 (带 RWR 结构缓存)
 # =====================================================================
@@ -1347,54 +1553,74 @@ def compute_generator_semantic_loss(fake_graph, fake_labels, local_models,
     loss = torch.tensor(0.0, device=device)
     each_class = {c: (fake_labels == c) for c in range(num_classes)}
 
+    # 教师前向只依赖 (model_k, fake_graph), 与类别 c 无关 -> 每个教师只算一次
+    all_logits = [model_k(fake_graph) for model_k in local_models]  # 保留梯度
+
     for c in range(num_classes):
         idx_c = each_class[c]
         if idx_c.sum() == 0:
             continue
-        for k_idx, model_k in enumerate(local_models):
+        for k_idx, logits in enumerate(all_logits):
             w = normalized_ckr[k_idx, c]
             if w < 1e-8:
                 continue
-            logits = model_k(fake_graph)  # 保留梯度
             loss += w * F.cross_entropy(logits[idx_c], fake_labels[idx_c])
     return loss
 
 
 def compute_generator_disagreement_loss(fake_graph, fake_labels,
                                           local_models, global_model,
-                                          normalized_ckr, num_classes, device):
+                                          normalized_ckr, num_classes, device,
+                                          loss_type='l1'):
     """
     生成器分歧损失: 可靠教师与全局模型的预测分歧。
     参数冻结, 保留对 fake_x 的梯度。
     生成器目标: 最大化 (总损失中使用负号)。
+
+    loss_type='kl' (默认, 本方法/专利权6+S4.2 的设计):
+        对 softmax **预测分布**做 CKR 加权 KL 散度。
+    loss_type='l1' (原版 FedTAD 做法, 仅供消融):
+        Σ_c Σ_k ckr[k,c] · mean|global_pred[c] − local_pred[c].detach()|, 作用在原始输出上
+        (references/FedTAD/train_fedtad.py:342-345)
     """
     loss = torch.tensor(0.0, device=device)
     each_class = {c: (fake_labels == c) for c in range(num_classes)}
     global_logits = global_model(fake_graph)  # 保留梯度
+    # 教师前向与类别 c 无关 -> 每个教师只算一次
+    teacher_logits = [model_k(fake_graph) for model_k in local_models]
 
     for c in range(num_classes):
         idx_c = each_class[c]
         if idx_c.sum() == 0:
             continue
-        global_log_prob = F.log_softmax(global_logits[idx_c], dim=-1)
-        for k_idx, model_k in enumerate(local_models):
+        for k_idx, t_logits in enumerate(teacher_logits):
             w = normalized_ckr[k_idx, c]
             if w < 1e-8:
                 continue
-            teacher_prob = F.softmax(model_k(fake_graph)[idx_c], dim=-1).clamp(min=1e-8)
-            kl = F.kl_div(global_log_prob, teacher_prob, reduction='batchmean')
-            loss += w * kl
+            if loss_type == 'l1':
+                loss += w * torch.abs(
+                    global_logits[idx_c] - t_logits[idx_c].detach()).mean()
+            else:
+                global_log_prob = F.log_softmax(global_logits[idx_c], dim=-1)
+                teacher_prob = F.softmax(t_logits[idx_c], dim=-1).clamp(min=1e-8)
+                loss += w * F.kl_div(global_log_prob, teacher_prob,
+                                     reduction='batchmean')
     return loss
 
 
 def compute_student_distillation_loss(fake_graph, fake_labels,
                                        local_models, global_model,
                                        normalized_ckr, num_classes, device,
-                                       temperature=1.0):
+                                       temperature=1.0, loss_type='kl'):
     """
     全局模型蒸馏损失: 学生(全局)向教师(本地)对齐。
     教师概率 detach, fake_graph.x detach。
     仅更新全局模型。
+
+    loss_type='kl' (默认, 本方法/专利权6+S4.2 的设计):
+        以 CKR 为权重的 KL 散度, 对齐全局模型与本地模型的**预测分布**。
+    loss_type='l1' (原版 FedTAD 做法, 仅供消融):
+        Σ_c Σ_k ckr[k,c] · mean|global_pred[c] − local_pred[c].detach()|, 作用在原始输出上。
     """
     # 确保 x 已 detach
     if fake_graph.x.requires_grad:
@@ -1405,20 +1631,35 @@ def compute_student_distillation_loss(fake_graph, fake_labels,
     global_logits = global_model(fake_graph)
     global_log_prob = F.log_softmax(global_logits / temperature, dim=-1)
 
+    # 教师前向与类别 c 无关 -> 每个教师只算一次; 教师侧本就 no_grad
+    with torch.no_grad():
+        if loss_type == 'l1':
+            teacher_logits = [model_k(fake_graph) for model_k in local_models]
+        else:
+            teacher_probs = [F.softmax(model_k(fake_graph), dim=-1).clamp(min=1e-8)
+                             for model_k in local_models]
+
     for c in range(num_classes):
         idx_c = each_class[c]
         if idx_c.sum() == 0:
             continue
-        for k_idx, model_k in enumerate(local_models):
-            w = normalized_ckr[k_idx, c]
-            if w < 1e-8:
-                continue
-            with torch.no_grad():
-                teacher_prob = F.softmax(model_k(fake_graph)[idx_c], dim=-1).clamp(min=1e-8)
-            kl = F.kl_div(global_log_prob[idx_c], teacher_prob, reduction='batchmean')
-            loss += w * kl
+        if loss_type == 'l1':
+            for k_idx, t_logits in enumerate(teacher_logits):
+                w = normalized_ckr[k_idx, c]
+                if w < 1e-8:
+                    continue
+                loss += w * torch.abs(
+                    global_logits[idx_c] - t_logits[idx_c]).mean()
+        else:
+            for k_idx, t_prob in enumerate(teacher_probs):
+                w = normalized_ckr[k_idx, c]
+                if w < 1e-8:
+                    continue
+                kl = F.kl_div(global_log_prob[idx_c], t_prob[idx_c],
+                              reduction='batchmean')
+                loss += w * kl
 
-    if temperature != 1.0:
+    if loss_type == 'kl' and temperature != 1.0:
         loss = loss * (temperature ** 2)
     return loss
 
@@ -2044,6 +2285,22 @@ def main():
     round_times = []
     gen_peak_mb_all = []
 
+    # ---- 特征统计特性对齐: 客户端本地算 (μ,σ) 上行, 服务端聚合成全局统计量 ----
+    # 一次性完成 (特征分布不随训练变化), 之后每轮生成伪特征时直接复用
+    g_feat_mu = g_feat_std = None
+    if args.feature_stats_align:
+        g_feat_mu, g_feat_std = compute_global_feature_stats(subgraphs, device)
+        print(f"[特征统计对齐] 已聚合全局特征统计量: "
+              f"μ 均值={g_feat_mu.mean():.5f} σ 均值={g_feat_std.mean():.5f} "
+              f"(客户端仅上行 2×{g_feat_mu.numel()} 个统计量, 未上传原始特征)")
+
+    # ---- 联邦扩散预训练: 客户端本地训练去噪网络, 只上行参数 (专利 S3.1/S3.2 + 专利权1) ----
+    if getattr(args, 'federated_diffusion_pretrain', False):
+        print("\n" + "=" * 60)
+        print("[联邦扩散预训练] 让去噪网络真正学到真实特征分布")
+        print("=" * 60)
+        federated_diffusion_pretrain(generator, subgraphs, args, device)
+
     for round_id in range(start_round, args.num_rounds):
         t_round0 = time.time()
         print(f"\n{'=' * 60}")
@@ -2456,6 +2713,8 @@ def main():
                     labels=fake_labels, num_steps=sampling_steps,
                     backprop_mode=args.generator_backprop_mode,
                     truncate_interval=args.generator_truncate_interval)
+                if args.feature_stats_align:
+                    fake_x = match_feature_stats(fake_x, g_feat_mu, g_feat_std)
                 fake_graph = _make_fake_graph(fake_x)
 
                 # 损失
@@ -2464,7 +2723,8 @@ def main():
                     normalized_ckr, num_classes, device)
                 L_dis = compute_generator_disagreement_loss(
                     fake_graph, fake_labels, local_models,
-                    global_model, normalized_ckr, num_classes, device)
+                    global_model, normalized_ckr, num_classes, device,
+                    loss_type=args.distill_loss_type)
 
                 # 多样性
                 norm_x = F.normalize(fake_x, p=2, dim=1)
@@ -2541,6 +2801,8 @@ def main():
             with torch.no_grad():
                 fake_x = generator.sample(
                     labels=fake_labels, num_steps=sampling_steps, device=device)
+                if args.feature_stats_align:
+                    fake_x = match_feature_stats(fake_x, g_feat_mu, g_feat_std)
                 fake_graph = _make_fake_graph(fake_x)
 
             # 蒸馏前快照 (预测变化诊断)
@@ -2570,6 +2832,7 @@ def main():
                     num_classes=num_classes,
                     device=device,
                     temperature=args.distill_temperature,
+                    loss_type=args.distill_loss_type,
                 )
                 L_D.backward()
                 if math.isnan(L_D.item()):

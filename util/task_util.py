@@ -232,22 +232,20 @@ def rwr_subgraph_sampling(edge_index, num_nodes, anchor_nodes,
 
 def subgraph_contrastive_loss(z1, z2, tau=0.5):
     """
-    子图-子图跨视图 InfoNCE 对比损失。
+    子图-子图跨视图 InfoNCE 对比损失 (对齐专利 S2.5 公式)。
+
     正样本: (z1[i], z2[i])
-    负样本: (z1[i], z1[j!=i]), (z2[i], z2[j!=i]), (z1[i], z2[j!=i])
+    负样本: (z1[i], z2[j!=i])  跨视图不同节点
+
+    分母为整行 softmax 归一化项, **含正样本自身**
+        exp(sim(z1_i, z2_i)/tau) + sum_{j!=i} exp(sim(z1_i, z2_j)/tau)
+    等价于对相似度矩阵按行做 log_softmax 后取对角。
     """
-    device = z1.device
-    batch_size = z1.shape[0]
     z1 = F.normalize(z1, p=2, dim=1)
     z2 = F.normalize(z2, p=2, dim=1)
-    sim = torch.mm(z1, z2.t()) / tau
-    neg_mask = ~torch.eye(batch_size, device=device, dtype=torch.bool)
-    sim_max, _ = torch.max(sim, dim=1, keepdim=True)
-    exp_sim = torch.exp(sim - sim_max.detach())
-    denom = (exp_sim * neg_mask.float()).sum(dim=1)
-    numer = torch.exp(torch.diag(sim) - sim_max.squeeze())
-    log_prob = torch.log(numer / denom + 1e-8)
-    return -log_prob.mean()
+    sim = torch.mm(z1, z2.t()) / tau          # [B, B]
+    log_prob = F.log_softmax(sim, dim=1)      # 分母含 j=i 项
+    return -log_prob.diag().mean()
 
 
 # =========================================================================

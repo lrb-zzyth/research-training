@@ -234,6 +234,39 @@
       </el-form-item>
 
       <!-- ==================================================== -->
+      <!--  蒸馏与联邦扩散预训练（2026-09-21 新增）                  -->
+      <!-- ==================================================== -->
+      <el-divider content-position="left">{{ $t('蒸馏与联邦扩散预训练（Distillation & Fed Diffusion）') }}</el-divider>
+      <el-form-item :label="$t('蒸馏损失形式（Distill Loss）')">
+        <el-select v-model="config.distill_loss_type" style="width: 100%">
+          <el-option label="KL 散度（本方法专利设计 / 论文 Eq.10）" value="kl" />
+          <el-option label="L1（上游参考代码写法）" value="l1" />
+        </el-select>
+      </el-form-item>
+      <el-form-item :label="$t('联邦扩散预训练（Fed Diffusion Pretrain）')">
+        <el-switch v-model="config.federated_diffusion_pretrain" />
+        <span class="hint">{{ $t('客户端本地训练去噪网络, 仅上传参数, 原始特征不出域') }}</span>
+      </el-form-item>
+      <template v-if="config.federated_diffusion_pretrain">
+        <el-form-item :label="$t('预训练联邦轮数（Pretrain Rounds）')">
+          <el-input-number v-model="config.diffusion_pretrain_rounds" :min="1" :max="200" />
+        </el-form-item>
+        <el-form-item :label="$t('预训练本地 epoch（Pretrain Epochs）')">
+          <el-input-number v-model="config.diffusion_pretrain_epochs" :min="1" :max="500" />
+        </el-form-item>
+        <el-form-item :label="$t('预训练批大小（Pretrain Batch）')">
+          <el-input-number v-model="config.diffusion_pretrain_batch" :min="2" :max="8192" :step="32" />
+        </el-form-item>
+        <el-form-item :label="$t('预训练学习率（Pretrain LR）')">
+          <el-input-number v-model="config.diffusion_pretrain_lr" :min="1e-6" :max="1" :step="0.0001" />
+        </el-form-item>
+      </template>
+      <el-form-item :label="$t('特征统计对齐（Feature Stats Align）')">
+        <el-switch v-model="config.feature_stats_align" />
+        <span class="hint">{{ $t('实验性: 实测会令生成器梯度塌缩, 默认关闭') }}</span>
+      </el-form-item>
+
+      <!-- ==================================================== -->
       <!--  双重终止机制                                           -->
       <!-- ==================================================== -->
       <el-divider content-position="left">{{ $t('双重终止机制（Double Termination）') }}</el-divider>
@@ -313,18 +346,26 @@ const defaults = {
   rwr_restart_prob: 0.5,
   rwr_subgraph_size: 5,
   contrastive_batch_size: 64,
-  contrastive_temperature: 0.5,
+  contrastive_temperature: 0.2,
   lambda_subgraph: 0.1,
   contrastive_anchor_scope: 'all_nodes',
   // 教师引导扩散式生成器
-  diffusion_steps: 10,
+  diffusion_steps: 20,
   diffusion_hidden: 256,
   diffusion_beta_start: 0.0001,
-  diffusion_beta_end: 0.02,
+  diffusion_beta_end: 0.5,
   generator_lr: 0.001,
   distill_lr: 0.001,
   lambda_sem: 1.0,
   lambda_diversity: 0.1,
+  // 蒸馏/扩散 (2026-09-21 算法主线更新后同步)
+  distill_loss_type: 'kl',
+  federated_diffusion_pretrain: true,
+  diffusion_pretrain_rounds: 10,
+  diffusion_pretrain_epochs: 30,
+  diffusion_pretrain_batch: 256,
+  diffusion_pretrain_lr: 0.001,
+  feature_stats_align: false,
   // 双重终止
   f1_threshold: 0.1,
   auc_threshold: 1.0,
