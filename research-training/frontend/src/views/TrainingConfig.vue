@@ -153,9 +153,14 @@
       <!-- ==================================================== -->
       <el-divider content-position="left">{{ $t('类别加权交叉熵（Weighted CE）') }}</el-divider>
       <el-form-item :label="$t('启用加权交叉熵（Enable Weighted CE）')">
-        <el-switch v-model="config.use_weighted_ce" />
+        <el-select v-model="config.use_weighted_ce" style="width: 100%">
+          <el-option label="自动（跟随任务模式：anomaly_binary=开 / multiclass=关）" :value="null" />
+          <el-option label="强制开启" :value="true" />
+          <el-option label="强制关闭（multiclass 推荐）" :value="false" />
+        </el-select>
+        <span class="hint">{{ $t('选「自动」时不传该参数, 由训练端按 task_mode 决定; 避免覆盖自适应逻辑') }}</span>
       </el-form-item>
-      <template v-if="config.use_weighted_ce">
+      <template v-if="config.use_weighted_ce === true">
         <el-form-item :label="$t('加权方法（Weight Method）')">
           <el-select v-model="config.class_weight_method" style="width:200px">
             <el-option label="inverse（逆频率）" value="inverse" />
@@ -270,14 +275,20 @@
       <!--  双重终止机制                                           -->
       <!-- ==================================================== -->
       <el-divider content-position="left">{{ $t('双重终止机制（Double Termination）') }}</el-divider>
-      <el-form-item :label="$t('F1 连续提升阈值（F1 Threshold %）')">
-        <el-input-number v-model="config.f1_threshold" :min="0.01" :max="5" :step="0.01" />
-        <span style="margin-left:8px;color:#909399;">{{ $t('连续三轮低于此值则正常收敛') }}</span>
+      <el-form-item :label="$t('启用双重终止（Enable）')">
+        <el-switch v-model="doubleTerminationOn" />
+        <span class="hint">{{ $t('默认关闭: 论文协议为固定 100 轮; 开启后收敛即提前结束, 与论文不可比') }}</span>
       </el-form-item>
-      <el-form-item :label="$t('低资源 AUC 阈值（AUC Threshold %）')">
-        <el-input-number v-model="config.auc_threshold" :min="0.01" :max="10" :step="0.01" />
-        <span style="margin-left:8px;color:#909399;">{{ $t('10% 尾部客户端连续两轮增幅低于此值则提前终止') }}</span>
-      </el-form-item>
+      <template v-if="doubleTerminationOn">
+        <el-form-item :label="$t('F1 连续提升阈值（F1 Threshold %）')">
+          <el-input-number v-model="config.f1_threshold" :min="0.01" :max="5" :step="0.01" />
+          <span style="margin-left:8px;color:#909399;">{{ $t('连续三轮低于此值则正常收敛') }}</span>
+        </el-form-item>
+        <el-form-item :label="$t('低资源 AUC 阈值（AUC Threshold %）')">
+          <el-input-number v-model="config.auc_threshold" :min="0.01" :max="10" :step="0.01" />
+          <span style="margin-left:8px;color:#909399;">{{ $t('10% 尾部客户端连续两轮增幅低于此值则提前终止') }}</span>
+        </el-form-item>
+      </template>
 
       <el-divider />
       <el-form-item>
@@ -336,8 +347,8 @@ const defaults = {
   knn_k: 5,
   generator_steps: 1,
   distillation_steps: 5,
-  // 加权 CE
-  use_weighted_ce: true,
+  // 加权 CE (null = 不传该参数, 由训练端按 task_mode 自适应)
+  use_weighted_ce: null,
   class_weight_method: 'inverse',
   beta: 0.999,
   // 子图-子图跨视图对比
@@ -367,11 +378,21 @@ const defaults = {
   diffusion_pretrain_lr: 0.001,
   feature_stats_align: false,
   // 双重终止
-  f1_threshold: 0.1,
-  auc_threshold: 1.0,
+  // 双重终止: -1e6 = 关闭 (论文协议为固定 100 轮)
+  f1_threshold: -1e6,
+  auc_threshold: -1e6,
 }
 
 const config = reactive({ ...defaults })
+
+// 双重终止开关: 关闭时把两个阈值置 -1e6 (训练端条件永不成立)
+const doubleTerminationOn = computed({
+  get: () => config.f1_threshold > -1e5 || config.auc_threshold > -1e5,
+  set: (v) => {
+    if (v) { config.f1_threshold = 0.1; config.auc_threshold = 1.0 }
+    else { config.f1_threshold = -1e6; config.auc_threshold = -1e6 }
+  },
+})
 
 // B1-B4 预设模板: 只组合既有字段, 不引入新参数
 const PRESETS = {

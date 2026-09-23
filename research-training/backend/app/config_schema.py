@@ -108,10 +108,10 @@ CANONICAL_SCHEMA: dict[str, dict] = {
                      "description": "权重衰减"},
 
     # ---- 客户端分类参数 ----
-    "use_weighted_ce": {"type": "bool", "default": True, "group": "classification",
+    "use_weighted_ce": {"type": "bool", "default": None, "group": "classification",
                         "hot_update_policy": "start", "requires_restart": True,
                         "effective_stage": "before_task",
-                        "description": "类别加权交叉熵 (仅用客户端 train 标签)"},
+                        "description": "类别加权交叉熵。默认 None = 不传该参数, 由训练端按 task_mode 自适应 (anomaly_binary=True, multiclass=False; 实测 multiclass 下加权 CE 为 -2.10 的负贡献)"},
     "class_weight_method": {"type": "str", "default": "inverse",
                             "choices": ["inverse", "effective_num"],
                             "group": "classification", "hot_update_policy": "start",
@@ -324,19 +324,25 @@ CANONICAL_SCHEMA: dict[str, dict] = {
                          "group": "task", "hot_update_policy": "start",
                          "requires_restart": True, "effective_stage": "before_task",
                          "description": "模型选择指标 (空=按任务模式默认)"},
-    "f1_threshold": {"type": "float", "default": 0.1, "min": 0.0, "max": 100.0,
+    "f1_threshold": {"type": "float", "default": -1e6, "min": -1e6, "max": 100.0,
                      "group": "task", "hot_update_policy": "start",
                      "requires_restart": True, "effective_stage": "before_task",
-                     "description": "主指标连续三轮提升阈值 (终止)"},
-    "auc_threshold": {"type": "float", "default": 1.0, "min": 0.0, "max": 100.0,
+                     "description": "双重终止第一条件: 主指标连续三轮提升 < 该值则终止。"
+                                    "默认 -1e6 = **关闭**(条件永不成立)。"
+                                    "原因: 论文协议为固定 100 轮, 且全部自跑实验均跑满 100 轮"
+                                    "(federated_mode='fedavg' 时该早停代码是激活的, 收敛后连续 3 轮"
+                                    "增幅 <0.1% 即 break, 约 20~30 轮就会提前结束, 与论文不可比)。"
+                                    "需启用时设为 0.1 等正值"},
+    "auc_threshold": {"type": "float", "default": -1e6, "min": -1e6, "max": 100.0,
                       "group": "task", "hot_update_policy": "start",
                       "requires_restart": True, "effective_stage": "before_task",
-                      "description": "低资源客户端提前终止阈值"},
+                      "description": "双重终止第二条件: 低资源客户端指标连续两轮增幅 < 该值则终止。"
+                                     "默认 -1e6 = **关闭**, 理由同上。需启用时设为 1.0 等正值"},
     "allow_anomaly_majority": {"type": "bool", "default": False, "group": "task",
                                "hot_update_policy": "start", "requires_restart": True,
                                "effective_stage": "before_task",
                                "description": "允许异常为多数类"},
-    "resplit_stratified": {"type": "bool", "default": True, "group": "task",
+    "resplit_stratified": {"type": "bool", "default": None, "group": "task",
                            "hot_update_policy": "start", "requires_restart": True,
                            "effective_stage": "before_task",
                            "description": "标签映射后分层重划分。⚠️ 本平台默认 task_mode="

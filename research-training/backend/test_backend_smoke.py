@@ -194,7 +194,10 @@ def main():
                 "root": "./dataset", "dataset": "Cora",
                 "task_mode": "anomaly_binary",
                 "normal_classes": "0,1,2,3", "anomaly_classes": "4,5,6",
-                "num_clients": 2, "federated_rounds": 3, "num_epochs": 1,
+                # 轮数给足余量: 热更新在第 1 轮后提交, 需留出"后续轮次"以验证
+                # "下一轮生效"语义。原先 3 轮时窗口只有第 2 轮, 训练端在正式轮次前
+                # 还要跑联邦扩散预训练(约 3s), 轮次边界会被挤到任务尾声导致更新落空。
+                "num_clients": 2, "federated_rounds": 8, "num_epochs": 1,
                 "learning_rate": 0.01, "hid_dim": 32, "dropout": 0.2,
                 "use_weighted_ce": True,
                 "contrastive_mode": "subgraph_cross_view",
