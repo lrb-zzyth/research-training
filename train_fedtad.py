@@ -871,6 +871,17 @@ def collect_final_metrics(model, subgraphs, task_mode, split='test',
         client_weighted_acc = (sum(em['accuracy'] * test_counts[ci]
                                    for ci, em in per_client.items()) / wsum
                                if wsum > 0 else float('nan'))
+        # ---- FedTAD 原版口径: 按**客户端总节点数**加权 (非测试集大小) ----
+        # 原版 references/FedTAD/train_fedtad.py:227
+        #   global_acc_test += x.shape[0]/global_data.x.shape[0] * acc_test
+        node_counts = {ci: int(sg.x.shape[0]) for ci, sg in enumerate(subgraphs)}
+        ntot = sum(node_counts.values())
+        fedtad_acc = (sum(em['accuracy'] * node_counts[ci]
+                          for ci, em in per_client.items()) / ntot
+                      if ntot > 0 else float('nan'))
+        fedtad_f1 = (sum(em['macro_f1'] * node_counts[ci]
+                         for ci, em in per_client.items()) / ntot
+                     if ntot > 0 else float('nan'))
         return {
             'pooled': {'accuracy': pooled_acc, 'macro_f1': pooled_macro_f1,
                        'per_class_f1': pooled_f1,
@@ -878,11 +889,13 @@ def collect_final_metrics(model, subgraphs, task_mode, split='test',
             'client_macro': {'accuracy': client_macro_acc, 'macro_f1': client_macro_f1},
             'client_weighted': {'accuracy': client_weighted_acc,
                                 'macro_f1': client_weighted_f1},
+            'fedtad_official': {'accuracy': fedtad_acc, 'macro_f1': fedtad_f1},
             'per_client': per_client,
             'valid_clients': {'all': len(per_client)},
             'num_test_samples': num_test_samples,
             'evaluation_scope': evaluation_scope,
-            'aggregation_levels': ['pooled', 'client_macro', 'client_weighted'],
+            'aggregation_levels': ['pooled', 'client_macro', 'client_weighted',
+                                   'fedtad_official'],
             'metric_comparability_group': f'{task_mode}|{evaluation_scope}|{split}',
         }
 

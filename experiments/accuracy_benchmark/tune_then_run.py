@@ -41,7 +41,7 @@ SEARCH_SPACE_HELP = """
 搜索空间 (对齐论文 λ1/λ2/I/Ig/Id, 另加本方法实测敏感项):
   lambda_sem        {0.001,0.01,0.1,1.0}   生成器语义损失系数 (=论文 λ1)
   lambda_diversity  {0.001,0.01,0.1}       生成器多样性损失系数 (=论文 λ2)
-  distill_steps     {1,3,5,10}             蒸馏内迭代 (=论文 I)
+  distill_steps     {1,3,5,10,25}             蒸馏内迭代 (=论文 I)
   generator_steps   {1,3,5}                生成器内迭代 (=论文 Ig)
   contrastive_temperature {0.05,0.1,0.2,0.35}  对比温度 (实测越小越好)
   lambda_subgraph   {0.05,0.1,0.5}         对比损失权重
@@ -87,6 +87,10 @@ def run_one(ds, nc, seed, outdir, extra=()):
            "--task_mode", "multiclass", "--selection_metric", "accuracy",
            "--f1_threshold=-1e6", "--auc_threshold=-1e6",
            "--seed", str(seed), "--checkpoint_dir", outdir,
+           # 对齐 FedTAD: 客户端在**全部** train_idx 上训练。
+           # 本仓库默认会留 20% 作 reliability_idx(仅动态 CKR 需要),
+           # 在 static_topology 下该保留集不被使用, 却使训练数据少 20%。
+           "--reliability_holdout_ratio", "0",
            "--emit_events", "--events_jsonl", os.path.join(outdir, "events.jsonl"),
            "--final_metrics_json", os.path.join(outdir, "final_metrics.json"),
            "--metrics_jsonl", os.path.join(outdir, "metrics.jsonl"),
@@ -117,7 +121,9 @@ def suggest(trial):
     return {
         "lambda_sem": trial.suggest_categorical("lambda_sem", [0.001, 0.01, 0.1, 1.0]),
         "lambda_diversity": trial.suggest_categorical("lambda_diversity", [0.001, 0.01, 0.1]),
-        "distill_steps": trial.suggest_categorical("distill_steps", [1, 3, 5, 10]),
+        # 加入 25: 原版 FedTAD 每轮蒸馏 = glb_epochs(5) × it_d(5) = 25,
+        # 原搜索空间上限只有 10, 永远够不到原版强度
+        "distill_steps": trial.suggest_categorical("distill_steps", [1, 3, 5, 10, 25]),
         "generator_steps": trial.suggest_categorical("generator_steps", [1, 3, 5]),
         "contrastive_temperature": trial.suggest_categorical(
             "contrastive_temperature", [0.05, 0.1, 0.2, 0.35]),
@@ -130,7 +136,7 @@ def suggest(trial):
 def tune(ds, n_trials):
     storage = f"sqlite:///{os.path.join(OUT, 'optuna_tune.db')}"
     study = optuna.create_study(
-        study_name=f"tune2_{ds}_c{TUNE_TIER}", storage=storage, load_if_exists=True,
+        study_name=f"tune4_{ds}_c{TUNE_TIER}", storage=storage, load_if_exists=True,
         direction="maximize", sampler=optuna.samplers.TPESampler(seed=2024))
 
     def objective(trial):
