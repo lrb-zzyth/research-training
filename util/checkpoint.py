@@ -41,7 +41,9 @@ def save_checkpoint(save_dir, filename, global_model, generator=None,
                     round_idx=0, best_metric=0.0, task_mode='multiclass',
                     num_classes=7, feat_dim=None, normal_classes='',
                     anomaly_classes='', selection_metric='macro_f1',
-                    generator_cfg=None, is_best=True):
+                    generator_cfg=None, is_best=True,
+                    pretrain_ref=None, radius_bank=None,
+                    local_optimizers=None):
     """保存完整 checkpoint (模型 + 优化器 + CKR tracker + RNG + 元数据)。"""
     os.makedirs(save_dir, exist_ok=True)
     ckpt = {
@@ -63,6 +65,16 @@ def save_checkpoint(save_dir, filename, global_model, generator=None,
         ckpt['rng_state'] = rng_state
     if args is not None:
         ckpt['args'] = vars(args) if hasattr(args, '__dict__') else str(args)
+    # pretrained-manifold 约束状态 (resume 后必须还原同一 prior, 不得重建)
+    if pretrain_ref is not None:
+        ckpt['pretrain_ref'] = {k: v.detach().cpu()
+                                for k, v in pretrain_ref.items()}
+    if radius_bank is not None:
+        ckpt['radius_bank'] = radius_bank.detach().cpu()
+    # 本地 optimizer 状态 (Bug 5: persistent 模式下 resume 必须还原 Adam 动量)
+    if local_optimizers is not None:
+        ckpt['local_optimizer_states'] = [
+            opt.state_dict() for opt in local_optimizers]
 
     # RNG states
     ckpt['python_random_state'] = random.getstate()
@@ -116,7 +128,8 @@ def validate_checkpoint_meta(ckpt, expected_meta=None):
 def load_checkpoint(path, global_model=None, generator=None,
                     global_optimizer=None, gen_optimizer=None,
                     ckr_tracker=None, expected_meta=None,
-                    restore_rng=True, map_location='cpu'):
+                    restore_rng=True, map_location='cpu',
+                    local_optimizers=None):
     """
     加载 checkpoint。默认恢复 RNG 状态, 保证恢复后训练连续性。
 
@@ -137,6 +150,14 @@ def load_checkpoint(path, global_model=None, generator=None,
         gen_optimizer.load_state_dict(ckpt['gen_optimizer_state'])
     if ckr_tracker is not None and ckpt.get('ckr_tracker_state'):
         ckr_tracker.load_state_dict(ckpt['ckr_tracker_state'])
+    if local_optimizers is not None and ckpt.get('local_optimizer_states'):
+        states = ckpt['local_optimizer_states']
+        if len(states) != len(local_optimizers):
+            raise RuntimeError(
+                f"checkpoint local_optimizer_states 数量 {len(states)} 与当前 "
+                f"num_clients {len(local_optimizers)} 不一致")
+        for opt, st in zip(local_optimizers, states):
+            opt.load_state_dict(st)
 
     if restore_rng:
         # 注意: torch.load(map_location='cuda') 会把 RNG 状态张量也搬到 GPU,
@@ -183,8 +204,13 @@ def find_last_checkpoint(checkpoint_dir):
 
 
 def find_final_checkpoint(checkpoint_dir):
-    """训练结束加载哪个 checkpoint: 优先 best.pt, 否则最新 round_N.pt。"""
+    """训练结束加载哪个 checkpoint (Bug 6 修复):
+    best.pt (验证集选出的最佳模型, 最高优先级) → last.pt → 最新 round_N.pt。
+    """
     best = find_best_checkpoint(checkpoint_dir)
     if best is not None:
         return best
+    last = os.path.join(checkpoint_dir, 'last.pt')
+    if os.path.exists(last):
+        return last
     return find_last_checkpoint(checkpoint_dir)

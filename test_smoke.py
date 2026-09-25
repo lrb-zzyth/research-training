@@ -317,5 +317,32 @@ normal_ids = [i for i in range(35) if info26['mapping'][y26[i].item()] == 0]
 anom_ids = [i for i in range(35) if info26['mapping'][y26[i].item()] == 1]
 print(f"  normal={len(normal_ids)}, anomaly={len(anom_ids)}, ratio={info26['anomaly_ratio']:.3f} ✓")
 
+# --- Test 27: radius projection blocks radial cheating, keeps tangential grad ---
+print("\n[Test 27] pretrain-radius projection: radial invariance + tangential grad")
+from train_fedtad import project_to_pretrain_radius
+torch.manual_seed(2024)
+B27, F27 = 8, 16
+z27 = torch.randn(B27, F27, device=device, requires_grad=True)
+labels27 = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], device=device)
+bank27 = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], device=device)  # [C, M=2]
+
+x27 = project_to_pretrain_radius(z27, labels27, bank27)
+targets27 = bank27[labels27, torch.arange(B27, device=device) % 2]
+assert torch.allclose(x27.norm(dim=1), targets27, atol=1e-5), \
+    "projected norm must equal target radius"
+# radial invariance: project(a·z) == project(z)
+x27b = project_to_pretrain_radius(2.5 * z27, labels27, bank27)
+assert torch.allclose(x27, x27b, atol=1e-5), "radial invariance broken"
+# gradient: nonzero overall, radial component must vanish
+loss27 = (x27 * torch.randn_like(x27)).sum()
+loss27.backward()
+assert z27.grad is not None and z27.grad.norm() > 0, \
+    "tangential gradient must be nonzero"
+radial27 = (z27.grad * z27).sum(dim=1)
+assert torch.allclose(radial27, torch.zeros_like(radial27), atol=1e-4), \
+    f"radial grad component must vanish, got {radial27.abs().max().item():.3e}"
+print(f"  ||x||==r ✓ | project(a·z)==project(z) ✓ | |grad|="
+      f"{z27.grad.norm().item():.4f} | radial_grad≈0 ✓")
+
 # ------------------------------------------------------------------
-print(f"\n{'=' * 60}\nALL 26 TESTS PASSED ✓\n{'=' * 60}")
+print(f"\n{'=' * 60}\nALL 27 TESTS PASSED ✓\n{'=' * 60}")

@@ -1,7 +1,9 @@
-# FedTAD — Federated Graph Anomaly Detection
+# FedTAD — 联邦图学习研究实现（FedTAD 改进方法 + 正式实验战役）
 
-> Federated graph anomaly detection research implementation with a web-based
-> visual training and experiment management platform.
+> 方法 = **FedTAD**(IJCAI 2024, arXiv:2404.14061) + 两个自研组件：
+> ① 客户端**子图-子图跨视图对比学习**（InfoNCE）；② 服务端**条件 DDPM 伪图生成 + CKR 加权 KL 无数据知识蒸馏**。
+> 目标：在 Cora / CiteSeer / PubMed / CS / Physics × 5/10/20 客户端三档上全面超越 FedTAD 论文 Table 2。
+> 附 Web 可视化训练/实验管理平台。
 
 本文档对应仓库当前状态。详细文档：
 - 平台使用：[docs/PLATFORM_GUIDE.md](docs/PLATFORM_GUIDE.md)
@@ -9,32 +11,31 @@
 - 架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - API：[docs/API.md](docs/API.md)
 - 复现：[docs/REPRODUCTION.md](docs/REPRODUCTION.md)
+- **正式战役协议与服务器迁移**：`SERVER_MIGRATION_BEGINNER.md`、`server_migration_manifest.json`
 
 ---
 
-## 0. 版本更新说明（本次提交相对远程上一版）
+## 0. 版本更新说明（本次提交）
 
-> 远程 `main` 上一版停留在 `c434f91`（*新增 node_node 纯节点对比模式*）。本次提交把算法主线、Web 平台与文档一次性推进到当前状态。
-> 同步时**优先读本节**——尤其 §0.2 的参数重命名，沿用旧命令会直接报 `unrecognized arguments`。
+> 本次提交 = **correctness 修复 + DDPM 机制修复 + 正式战役 v2 协议 + 服务器迁移准备** 的完整收口。
+> 自上一版（`6318224`）以来累积：4 个文件改动 + 新增 tests/、formal campaign runner、迁移脚本与文档。
 
 ### 0.1 变更总览
 
 | 模块 | 主要变更 |
 |---|---|
-| **算法主线** | 对比学习由三种并行模式（`supcon` / `node_node` / `gradate`）统一为**子图-子图跨视图对比**（`--contrastive_mode subgraph_cross_view`，默认）；`util/gradate_contrastive.py` 删除 |
-| **生成器** | 生成器固定为**教师引导扩散式**，原 MLP 生成器移除；入口参数由 `--generator_type` 改为 `--generator_init`（`scratch` 默认 / `proxy_pretrained` 实验性） |
-| **CKR** | 新增**静态拓扑 CKR**（`--ckr_mode static_topology`，默认）与 `--distill_weighting static_ckr`；动态 CKR / fairness 作为实验性扩展默认关闭 |
-| **训练脚本** | `train_fedtad.py` 大幅重构：结构化事件（`--emit_events` → `[EVENT] {json}`）、轮次边界参数热更新、checkpoint 保存/恢复、指标与诊断落盘 |
-| **工具层** | 新增 `util/checkpoint.py`、`util/data_split.py`、`util/dynamic_ckr.py`、`util/rwr_cache.py`、`util/split_artifact.py` |
-| **Web 平台** | 新增 canonical 参数契约 `config_schema.py`（未知参数 422 拒绝）、参数热更新 + 审计记录、实验配置快照（`GET /experiments/{id}/config`）、从 checkpoint 恢复；前端新增 CKR 权重表与热更新面板，移除 `ParameterForm.vue` |
-| **文档** | 新增 `docs/`（架构 / API / 训练参数 / 平台指南 / 复现）、`docs/archive/` 历史审计归档与 `RELEASE_PLATFORM_REPORT.md` |
-| **目录整理** | 根目录 `train_fedavg.py` 移入 `legacy/`；新增 `experimental/`（实验系统）、`ckr/`（CKR 缓存） |
+| **对比增强修复** | `edge_perturbation` 无向性 bug 修复：按无向边为单位删/加并展开双向（原实现按有向条目删/加，第二视图被削成部分有向图） |
+| **DDPM 三大根因修复** | ① 去噪网络信息瓶颈 → `timestep_scalar` 直通残差 `eps_pred = exp(g_t)·x_t + residual`（`--diffusion_skip_mode`）；② 联邦扩散预训练欠训练 → 样本加权损失统计 + S2 逐层诊断；③ reverse 链爆炸 → posterior variance β̃_t（`--use_posterior_variance`） |
+| **radius + anchor 机制** | pretrained radius bank 流形约束（`--radius_constraint`，`x = r_c·z/‖z‖` 堵幅度作弊）+ L2-SP 参数锚（`--lambda_diffusion_anchor`）+ Stage1 冻结 `c(t)`（`--diffusion_freeze_skip_scale`）+ Stage2 warm-up（`--server_start_round`） |
+| **优化器生命周期** | 新增 `--local_optimizer_lifecycle`（`persistent` 旧行为 / `reset_each_round` 正式主线）：persistent Adam + 每轮广播的陈旧动量是 PubMed-10 崩塌根因（peak drop −15.4 → −3.2） |
+| **RNG 协议 v2** | 客户端 round/client 确定性重播种 + 服务端专用 generator，配对实验 C/B 严格可比；定位并记录 CUDA scatter 类算子的跨进程数值非确定性 |
+| **正式战役 v2** | `experiments/accuracy_benchmark/formal_campaign.py`：每 (dataset,tier) 独立 Optuna study、validation-only objective、test isolation（`--tuning_mode` 调参期零 test 计算）、formal health v2（任何 nonfinite → trial FAIL 且排除候选）、protocol/data-identity 校验与安全 resume、显存看门狗 + 可配置并发（`--n_jobs`，默认 2；首 trial 恒串行生成 CKR 缓存防竞态） |
+| **formal guard** | `--formal_campaign_guard`：启动校验 9 项正式协议（weighted CE ON / holdout 0 / accuracy 选轮 / reset optimizer / radius ON / align OFF / skip 冻结 / 不二次预训练 / Stage1 checkpoint 存在），违反即 ValueError |
+| **搜索空间 v2** | `lambda_sem ∈ {0.01,0.1,1.0}`（v1 的 0.001 因 Cora-5 实测 8/9 nonfinite/raw-runaway 移除）；`distill_steps ∈ {1,3,5}`（25 为 legacy 剔除）；新增 `server_start_round ∈ {0,1}` |
+| **测试** | 新增 `tests/`（generator 冻结 / checkpoint 状态管理 / resume freeze 策略 / Stage2 smoke / paired RNG / formal campaign 守卫与 test isolation 等 6 套件） |
+| **服务器迁移** | `server_migration_manifest.json`、`environment.yml` + `requirements_frozen.txt`（已验证环境导出）、`scripts/server_smoke_test.sh`、`scripts/run_formal_cell.sh`、`SERVER_MIGRATION_BEGINNER.md`（从零租服务器指南） |
 
-体量：27 个已跟踪文件改动（+5179 / −1650 行），新增 36 个文件（约 588 KB）。
-
-### 0.2 破坏性变更：命令行参数重命名
-
-下表左列的参数在 `c434f91` 之后的版本中**已移除**，旧命令需按第 8 节改写：
+### 0.2 破坏性变更：命令行参数重命名（仍适用，自 `c434f91` 起）
 
 | 旧参数（≤ `c434f91`） | 新参数（当前版本） | 说明 |
 |---|---|---|

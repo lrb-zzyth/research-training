@@ -33,6 +33,9 @@ import json
 import time
 import warnings
 import math
+import random
+import hashlib
+import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -268,6 +271,85 @@ parser.add_argument('--federated_diffusion_pretrain', action=argparse.BooleanOpt
                          '--diffusion_beta_end 默认改为 0.5 (alpha_bar_T=0.002 ≈ 纯噪声)。'
                          '关闭后行为与旧版一致(去噪网络不被训练)')
 parser.add_argument('--diffusion_pretrain_rounds', type=int, default=10)
+
+# ---- pretrained-manifold 约束 (radius + anchor) ----
+parser.add_argument('--radius_constraint', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='[默认开] 硬流形约束: 对抗期 fake_x = r_c * z / ||z||, '
+                         'r_c 来自预训练 radius bank(每类)。径向自由度消失 -> '
+                         '幅度作弊被堵死, 切向(语义)梯度保留, 仍可搜 hard examples。')
+parser.add_argument('--radius_bank_size', type=int, default=64,
+                    help='radius bank 每类采样数 (只存标量, 显存可忽略)')
+parser.add_argument('--lambda_diffusion_anchor', type=float, default=1e-2,
+                    help='L2-SP 参数锚系数: 把生成器锚定在联邦预训练后的 θ_pre, '
+                         '防止 prior 被对抗精调洗掉。0 = 关闭')
+parser.add_argument('--use_posterior_variance', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='[默认开] DDPM reverse 用 posterior variance β̃_t 代替 √β_t '
+                         '(当前 β 很大, √β_t 注入噪声过强)')
+parser.add_argument('--diffusion_residual_skip', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='[诊断 A/B, 默认关] denoiser 直通残差: eps_pred = x_t + body(x_t,t,c)。'
+                         '高噪声步 x_t≈ε, 恒等映射不再被迫穿过 hidden_dim 瓶颈 '
+                         '(S3 已确认 256 瓶颈是晚 t MSE 0.64 的根因)。'
+                         '等价于 --diffusion_skip_mode fixed')
+parser.add_argument('--diffusion_skip_mode', type=str, default='none',
+                    choices=['none', 'fixed', 'timestep_scalar'],
+                    help='denoiser 直通残差模式: none=旧版; fixed=eps=x_t+body; '
+                         'timestep_scalar=eps=c(t)·x_t+body (每 timestep 一个可学习 '
+                         '正 scalar c(t)=exp(g_t), 初始化 1, 自动学 early-t 放大系数, '
+                         '修 fixed identity skip 的结构性 bias)')
+parser.add_argument('--pretrain_diagnostic_only', action='store_true',
+                    help='[诊断] 联邦预训练结束后只做 pretrain-only 健康检查并退出, '
+                         '不进对抗主循环 (分级验证 Stage 1)')
+parser.add_argument('--diffusion_pretrain_resume', type=str, default='',
+                    help='[诊断] 从保存的 pretrained_generator.pt 继续联邦预训练 '
+                         '(配合 --pretrain_diagnostic_only 用)')
+parser.add_argument('--diffusion_pretrain_resume_round', type=int, default=0,
+                    help='[诊断] 续跑前已完成的预训练轮数 (仅用于纵向 checkpoint 轮次标注)')
+parser.add_argument('--diffusion_pretrained_checkpoint', type=str, default='',
+                    help='[Stage 2 诊断] 加载已完成 Stage 1 的 pretrained generator '
+                         '权重初始化 Stage 2: 只加载权重(校验配置一致性), '
+                         '不恢复预训练 Adam 状态, 重建对抗期 optimizer。'
+                         '配合 --no-federated_diffusion_pretrain 使用')
+parser.add_argument('--diffusion_freeze_skip_scale', action='store_true',
+                    help='[Stage 2 诊断, 默认 False 保持旧实验兼容] 主循环前把 '
+                         'timestep_scalar 的 c(t) 冻结在 pretrained 值 '
+                         '(防止对抗 KL 把它变成新的幅度旋钮)')
+parser.add_argument('--local_optimizer_lifecycle', type=str, default='persistent',
+                    choices=['persistent', 'reset_each_round'],
+                    help='本地 optimizer 生命周期 (Bug 5): persistent=跨轮保留 '
+                         'Adam 动量并随 checkpoint 保存/恢复 (默认, 旧行为); '
+                         'reset_each_round=每轮广播后重建本地 optimizer '
+                         '(供 causal diagnostic)')
+parser.add_argument('--allow_legacy_resume_without_local_optimizer_state',
+                    action='store_true',
+                    help='[默认 False] 允许加载缺少 local_optimizer_states 的 '
+                         '旧 checkpoint (persistent 模式下轨迹与连续训练不一致, '
+                         '仅供兼容旧产物)')
+parser.add_argument('--formal_multiclass_protocol_guard', action='store_true',
+                    help='[正式主实验] 启动时打印并校验正式 multiclass 协议'
+                         '(weighted CE=ON/contrastive=ON/holdout=0/'
+                         'accuracy 选轮/reset optimizer), 违反即停止')
+parser.add_argument('--paired_rng_diag', action='store_true',
+                    help='[诊断] 打印 P0-P4 RNG fingerprint + 分类器参数 hash + '
+                         'client0 锚点/增强边 hash (paired-arm R0 一致性核验)')
+parser.add_argument('--deterministic_torch', action='store_true',
+                    help='[诊断] 开启 torch 确定性模式 (deterministic algorithms + '
+                         'cudnn.deterministic + cudnn.benchmark=False), '
+                         '用于定位 CUDA reduction 的跨进程数值不确定源')
+parser.add_argument('--server_start_round', type=int, default=0,
+                    help='[默认 0] Stage 2 服务器阶段 (生成器对抗更新 + 全局蒸馏) '
+                         '的启动轮次。round < server_start_round 时只执行客户端训练 '
+                         '+ FedAvg (SKIPPED 标记); >= 时执行完整现有 Stage 2。'
+                         'Stage 2 初始化 (pretrained 加载/bank/冻结/θ_pre) 不受影响, '
+                         '仍在主训练前完成。')
+parser.add_argument('--tuning_mode', action='store_true',
+                    help='[正式调参] test isolation: 调参模式下完全不计算/打印 test, '
+                         '只按 validation 选轮; objective/pruner 无法读取 test')
+parser.add_argument('--formal_campaign_guard', action='store_true',
+                    help='[正式战役] 启动时校验完整正式协议 (见 validate_formal_campaign), '
+                         '违反即 ValueError, 不自动修参数')
 parser.add_argument('--diffusion_pretrain_epochs', type=int, default=30)
 parser.add_argument('--diffusion_pretrain_batch', type=int, default=256)
 parser.add_argument('--diffusion_pretrain_lr', type=float, default=1e-3)
@@ -1036,9 +1118,240 @@ def _build_fairness_metrics(final_test, subgraphs, num_classes, task_mode, track
         **ckr_groups,
     }
 
+def reseed_client_rng(args, round_id, ci):
+    """
+    客户端本地随机流与服务器路径解耦 (paired-arm 一致性修复):
+
+    每个 (round, client) 使用确定性种子重播种 torch (cpu/cuda) 与 python random。
+    不做 save/restore —— 后续客户端/轮次都会重新播种, 服务器侧 (如 Stage2 采样、
+    nn.Embedding 初始化等) 的 RNG 消耗无法再污染客户端训练轨迹。
+    效果: C/B 同一 (round, client) 的 dropout / edge perturbation / 锚点采样
+    随机流逐位一致, 与服务器代码消耗 RNG 的数量完全无关。
+    """
+    local_seed = args.seed + round_id * 1000 + ci * 37
+    torch.manual_seed(local_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(local_seed)
+    random.seed(local_seed)
+
+
+def _model_param_hash(model):
+    h = hashlib.md5()
+    for p in model.parameters():
+        h.update(p.detach().cpu().numpy().tobytes())
+    return h.hexdigest()[:12]
+
+
+def _tensor_hash(t):
+    if t is None:
+        return 'None'
+    return hashlib.md5(t.detach().cpu().numpy().tobytes()).hexdigest()[:12]
+
+
+def _rng_fingerprint():
+    """torch(cpu/cuda) + python random 全局 RNG 状态的稳定 hash (仅诊断)。"""
+    h = hashlib.md5()
+    h.update(torch.get_rng_state().cpu().numpy().tobytes())
+    if torch.cuda.is_available():
+        h.update(torch.cuda.get_rng_state().cpu().numpy().tobytes())
+    h.update(pickle.dumps(random.getstate()))
+    return h.hexdigest()[:12]
+
+
 def set_requires_grad(module, enabled):
     for p in module.parameters():
         p.requires_grad_(enabled)
+
+
+def configure_generator_trainability(generator, trainable,
+                                     freeze_skip_scale=False):
+    """
+    设置生成器参数 trainable 状态 (Bug 1 修复)。
+
+    freeze_skip_scale=True 时, timestep_scalar 的 skip scale c(t) 无论
+    trainable 如何切换, 恒保持 requires_grad=False —— 真正冻结, 不依赖
+    "optimizer 里没有它" 的间接保证。
+    """
+    skip_p = None
+    if (freeze_skip_scale
+            and getattr(generator, 'skip_mode', 'none') == 'timestep_scalar'):
+        skip_p = generator.skip_log_scale.weight
+    for p in generator.parameters():
+        if p is skip_p:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(trainable)
+
+
+def validate_formal_protocol(args):
+    """
+    正式 multiclass 主实验协议 guard (--formal_multiclass_protocol_guard 时生效):
+    启动时打印协议字段, 任一不满足立即报错退出。不静默修参数。
+    """
+    fields = [
+        ('task_mode', 'multiclass', args.task_mode),
+        ('selection_metric', 'accuracy', args.selection_metric),
+        ('reliability_holdout_ratio', 0, args.reliability_holdout_ratio),
+        ('use_weighted_ce', True, bool(args.use_weighted_ce)),
+        ('contrastive_mode', 'subgraph_cross_view', args.contrastive_mode),
+        ('local_optimizer_lifecycle', 'reset_each_round',
+         args.local_optimizer_lifecycle),
+    ]
+    print("\n[Formal Multiclass Protocol]")
+    for name, expect, got in fields:
+        ok = (got == expect)
+        print(f"  {name:<26} = {got}  (期望 {expect}) {'✓' if ok else '✗'}")
+    print(f"  {'test_used_for_selection':<26} = False  (协议声明)")
+    bad = [name for name, expect, got in fields if got != expect]
+    if bad:
+        raise SystemExit(
+            "[Formal Multiclass Protocol] 违反: " + ", ".join(bad)
+            + " —— 停止, 不自动修参数")
+
+
+def validate_formal_campaign(args):
+    """正式战役 guard: 全部 protocol 字段必须满足, 违反即 ValueError。"""
+    import os as _os
+    checks = [
+        ('task_mode', args.task_mode, 'multiclass'),
+        ('use_weighted_ce', bool(args.use_weighted_ce), True),
+        ('reliability_holdout_ratio', args.reliability_holdout_ratio, 0),
+        ('selection_metric', args.selection_metric, 'accuracy'),
+        ('local_optimizer_lifecycle', args.local_optimizer_lifecycle,
+         'reset_each_round'),
+        ('radius_constraint', bool(args.radius_constraint), True),
+        ('feature_stats_align', bool(args.feature_stats_align), False),
+        ('diffusion_freeze_skip_scale',
+         bool(getattr(args, 'diffusion_freeze_skip_scale', False)), True),
+        ('federated_diffusion_pretrain',
+         bool(getattr(args, 'federated_diffusion_pretrain', False)), False),
+    ]
+    bad = [n for n, got, exp in checks if got != exp]
+    ck = getattr(args, 'diffusion_pretrained_checkpoint', '')
+    if not ck or not _os.path.exists(ck):
+        bad.append(f'diffusion_pretrained_checkpoint({ck} 不存在)')
+    if bad:
+        raise ValueError(
+            "[Formal Campaign Guard] 违反正式协议: " + ", ".join(bad)
+            + " —— 停止, 不自动修参数")
+
+
+def validate_run_args(args):
+    """互斥/非法 CLI 组合 fail-fast (Bug 3/4/9)。不静默猜测用户意图。"""
+    if (getattr(args, 'resume_checkpoint', '')
+            and getattr(args, 'diffusion_pretrained_checkpoint', '')):
+        raise ValueError(
+            "--resume_checkpoint 与 --diffusion_pretrained_checkpoint 互斥: "
+            "resume Stage2 和 fresh Stage2 pretrained 初始化不能同时使用。")
+    if (getattr(args, 'diffusion_pretrained_checkpoint', '')
+            and getattr(args, 'federated_diffusion_pretrain', False)):
+        raise ValueError(
+            "Fresh Stage2 from pretrained checkpoint 要求 "
+            "--no-federated_diffusion_pretrain (禁止加载 R20 后又二次联邦预训练)")
+    if (getattr(args, 'radius_constraint', False)
+            and getattr(args, 'feature_stats_align', False)):
+        raise ValueError(
+            "--radius_constraint 与 --feature_stats_align 不能同时开启: "
+            "事后 stats 对齐会破坏 radius manifold 不变式 "
+            "(feature_stats_align 仅供独立消融使用)")
+
+
+def resolve_resume_freeze_policy(saved_args, cli_freeze):
+    """
+    Bug A: resume 时 freeze 策略必须与 checkpoint 一致, 否则 fail-fast。
+
+    - 新 checkpoint (args 含 diffusion_freeze_skip_scale): 严格比对, 不一致 raise;
+    - legacy checkpoint (无该字段): 明确打印 warning, 按当前 CLI 策略执行
+      (未验证一致, 不伪装成已验证)。
+    返回实际采用的 freeze policy。
+    """
+    if isinstance(saved_args, dict) and 'diffusion_freeze_skip_scale' in saved_args:
+        saved_freeze = bool(saved_args['diffusion_freeze_skip_scale'])
+        if saved_freeze != bool(cli_freeze):
+            raise ValueError(
+                "Resume freeze 策略不一致: "
+                f"checkpoint diffusion_freeze_skip_scale={saved_freeze}, "
+                f"当前 CLI diffusion_freeze_skip_scale={bool(cli_freeze)}. "
+                "Resume requires the same Stage-2 skip-freeze policy "
+                "as the checkpoint.")
+        return saved_freeze
+    print("  [Resume] legacy checkpoint: 无 diffusion_freeze_skip_scale 字段, "
+          "无法核验 freeze 策略; 按当前 CLI 策略 "
+          f"({bool(cli_freeze)}) 执行 (未验证一致)")
+    return bool(cli_freeze)
+
+
+def validate_generator_cfg(saved_cfg, current_cfg):
+    """Bug 10: resume 时 generator 配置逐项核对; 缺失字段视为 legacy 并跳过。"""
+    for k in ('feat_dim', 'num_classes', 'hidden_dim', 'num_steps',
+              'beta_start', 'beta_end', 'skip_mode', 'use_posterior_variance'):
+        sv = saved_cfg.get(k)
+        if sv is None:
+            print(f"  [Resume] legacy generator_cfg: 缺字段 {k}, 依赖 "
+                  f"strict state_dict 校验")
+            continue
+        if sv != current_cfg.get(k):
+            raise ValueError(
+                f"[Resume] generator_cfg 不兼容: {k} 期望 "
+                f"{current_cfg.get(k)}, checkpoint 为 {sv}")
+
+
+def init_stage2_from_pretrained(generator, ckpt_path, args, device,
+                                num_classes):
+    """
+    Fresh Stage 2 初始化 (Mode A, Bug 2/10):
+      加载 pretrained DDPM 权重 → 校验配置一致性 (state_dict buffers, 严格) →
+      应用 freeze 策略 → θ_pre 快照 → radius bank → 重建对抗期 optimizer。
+    不恢复 Stage 1 Adam 状态。返回 (pretrain_ref, radius_bank, gen_optimizer)。
+    """
+    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cur_sd = generator.state_dict()
+    for k in ('betas', 'alphas', 'alpha_bars', 'posterior_variance'):
+        if k not in ck or not torch.allclose(ck[k].float().to(device),
+                                             cur_sd[k].float()):
+            raise ValueError(f"[Stage2] checkpoint 调度 buffer 不一致: {k}")
+    if (getattr(generator, 'skip_mode', 'none') != 'timestep_scalar'
+            or 'skip_log_scale.weight' not in ck):
+        raise ValueError("[Stage2] checkpoint 必须为 timestep_scalar 且含 "
+                         "skip_log_scale (当前配置不符)")
+    if (ck['net.0.weight'].shape != cur_sd['net.0.weight'].shape
+            or ck['time_embed.0.weight'].shape
+            != cur_sd['time_embed.0.weight'].shape):
+        raise ValueError("[Stage2] checkpoint denoiser 形状与当前配置不一致")
+    print("  [Stage2] legacy pretrained checkpoint: validated from "
+          "state_dict buffers (无 metadata, 逐项核验通过)")
+    generator.load_state_dict(ck)   # strict=True, key 不匹配直接报错
+    configure_generator_trainability(
+        generator, True, freeze_skip_scale=args.diffusion_freeze_skip_scale)
+    if args.diffusion_freeze_skip_scale:
+        print("  [Stage2] skip scale c(t) 已冻结于 pretrained 值 "
+              "(residual denoiser 仍可训练)")
+    pretrain_ref = {name: p.detach().clone()
+                    for name, p in generator.named_parameters()}
+    radius_bank = None
+    if args.radius_constraint:
+        radius_bank = build_pretrain_radius_bank(
+            generator, num_classes, device, args.radius_bank_size,
+            rng_seed=args.seed + 7777)   # 专用 RNG, 不消耗全局流
+        fin = bool(torch.isfinite(radius_bank).all()
+                   and (radius_bank > 0).all())
+        qs = torch.quantile(radius_bank,
+                            torch.tensor([0.25, 0.5, 0.75], device=device),
+                            dim=1)
+        print(f"  [Stage2 Radius Bank] 每类 p25={qs[0].tolist()} "
+              f"median={qs[1].tolist()} p75={qs[2].tolist()} | "
+              f"finite/positive={fin} "
+              f"(注意: bank 仍约 4.6x 真实半径, 如实记录)")
+        if not fin:
+            raise RuntimeError("[Stage2] radius bank 含 NaN/Inf/非正, 停止")
+    gen_optimizer = Adam([p for p in generator.parameters()
+                          if p.requires_grad],
+                         lr=args.generator_lr, weight_decay=0.0)
+    print("  [Stage2] 重建对抗期 generator optimizer "
+          f"({sum(1 for p in generator.parameters() if p.requires_grad)}"
+          f"/{sum(1 for _ in generator.parameters())} 参数组可训练, "
+          f"预训练 Adam 状态不恢复)")
+    return pretrain_ref, radius_bank, gen_optimizer
 
 
 def count_trainable_params(module):
@@ -1245,7 +1558,7 @@ def compute_ckr(subgraphs, num_classes, args, device):
     ckr_path = (f"./ckr/{args.dataset}_{args.partition}_{args.num_clients}_"
                 f"{args.task_mode}{cache_suffix}_s{args.seed}.pt")
     if os.path.exists(ckr_path):
-        ckr = torch.load(ckr_path).to(device)
+        ckr = torch.load(ckr_path, map_location='cpu').to(device)
         print(f"  [CKR] 加载缓存: {ckr_path}")
         return ckr
     os.makedirs("./ckr", exist_ok=True)
@@ -1303,6 +1616,15 @@ def federated_diffusion_pretrain(generator, subgraphs, args, device):
     else:
         print(f"  [联邦扩散预训练] 调度检查通过: alpha_bar_T={alpha_bar_T:.5f} ≈ 纯噪声 (符合专利 S3.1)")
 
+    # 续跑模式: 从保存的 denoiser 状态继续 (纵向诊断用)
+    if getattr(args, 'diffusion_pretrain_resume', ''):
+        ck = torch.load(args.diffusion_pretrain_resume, map_location=device,
+                        weights_only=False)
+        generator.load_state_dict(ck)
+        print(f"  [联邦扩散预训练] 从 {args.diffusion_pretrain_resume} 恢复 denoiser, "
+              f"续跑 {args.diffusion_pretrain_rounds} 轮 (此前已完成 "
+              f"{args.diffusion_pretrain_resume_round} 轮)")
+
     # 每个客户端本地参与训练的样本 = 该客户端的训练节点 (fit + reliability 之外不碰)
     client_data = []
     for ci, sg in enumerate(subgraphs):
@@ -1319,17 +1641,132 @@ def federated_diffusion_pretrain(generator, subgraphs, args, device):
           f"lr={args.diffusion_pretrain_lr}")
     print(f"  [联邦扩散预训练] 上行内容: 去噪网络参数 only（原始特征不出域, 符合专利权1）")
 
+    # ---- S2 诊断: 每客户端固定 diag subset (x0/t/ε 固定, 仅本地计算, 只上行标量) ----
+    # 隐私边界: 服务器只收 (n_diag, MSE) 标量, 不收任何诊断特征/原始数据。
+    T_steps = generator.num_steps
+    bucket_defs = {'early': (0, T_steps // 3),
+                   'mid': (T_steps // 3, 2 * T_steps // 3),
+                   'late': (2 * T_steps // 3, T_steps)}
+    diag = []
+    for ci, x, y in client_data:
+        n = x.shape[0]
+        n_diag = min(128, n)
+        # randperm 只支持 CPU generator; randint/randn 要求与输出同设备 -> 两个同种子 generator
+        g_cpu = torch.Generator(device='cpu').manual_seed(
+            args.seed + ci * 1000 + 7)
+        g_dev = torch.Generator(device=x.device).manual_seed(
+            args.seed + ci * 1000 + 7)
+        idx = torch.randperm(n, generator=g_cpu)[:n_diag]
+        x0d = x[idx]
+        yd = y[idx]
+        td = torch.randint(0, T_steps, (n_diag,), generator=g_dev,
+                           device=x.device)
+        epsd = torch.randn(x0d.shape, generator=g_dev, device=x.device,
+                           dtype=x0d.dtype)
+        ab = generator.alpha_bars[td].unsqueeze(-1)
+        xtd = torch.sqrt(ab) * x0d + torch.sqrt(1.0 - ab) * epsd
+        diag.append((ci, x0d, yd, td, epsd, xtd))
+
+    def _diag_eval(model, dg):
+        """在固定 (x_t, t, ε) 上评估 denoise MSE + timestep 分桶。无梯度。"""
+        _ci, _x0d, _yd, _td, _epsd, _xtd = dg
+        with torch.no_grad():
+            pred = model(_xtd, _td, _yd)
+            mse = float(((pred - _epsd) ** 2).mean().item())
+            bm = {}
+            for k, (lo, hi) in bucket_defs.items():
+                mask = (_td >= lo) & (_td < hi)
+                bm[k] = (float(((pred[mask] - _epsd[mask]) ** 2).mean().item())
+                         if mask.any() else float('nan'))
+        return mse, bm
+
+    def _weighted(vals, ns):
+        tot = sum(ns)
+        return sum(v * n for v, n in zip(vals, ns)) / max(tot, 1)
+
+    s2_records = []
+    longitudinal = []
+    total_steps = 0
+
+    # ---- 纵向 raw-sampling probe: 固定 labels + 固定 initial noise (跨轮可比) ----
+    num_classes_probe = int(max(int(sg.y.max().item()) for sg in subgraphs)) + 1
+    probe_per_class = 32
+    probe_labels = torch.arange(num_classes_probe, device=device).repeat_interleave(
+        probe_per_class)
+    probe_g = torch.Generator(device=device).manual_seed(args.seed + 4242)
+    probe_noise = torch.randn(probe_labels.shape[0], generator.feat_dim,
+                              generator=probe_g, device=device)
+    probe_rng = torch.Generator(device=device)   # 逐步反向噪声流, 每 checkpoint 重置
+    # 真实特征统计 (客户端本地统计, 只上行标量)
+    real_std_w = real_med_w = real_mean_w = real_p95_w = real_max_w = 0.0
+    tot_real_n = 0
+    for _ci, _x, _y in client_data:
+        n_real = _x.shape[0]
+        r_real = torch.linalg.vector_norm(_x, ord=2, dim=1)
+        real_std_w += float(_x.std().item()) * n_real
+        real_med_w += float(r_real.median().item()) * n_real
+        real_mean_w += float(r_real.mean().item()) * n_real
+        real_p95_w += float(torch.quantile(r_real, 0.95).item()) * n_real
+        real_max_w += float(r_real.max().item()) * n_real
+        tot_real_n += n_real
+    real_std = real_std_w / max(tot_real_n, 1)
+    real_med = real_med_w / max(tot_real_n, 1)
+    real_mean = real_mean_w / max(tot_real_n, 1)
+    real_p95 = real_p95_w / max(tot_real_n, 1)
+    real_max = real_max_w / max(tot_real_n, 1)
+    zero_base = _weighted([float((d[4] ** 2).mean().item()) for d in diag],
+                          [d[1].shape[0] for d in diag])
+    abT = generator.alpha_bars[-1].item()
+    print(f"  [schedule] T={T_steps} beta_start={args.diffusion_beta_start:.0e} "
+          f"beta_end={args.diffusion_beta_end} alpha_bar_T={abT:.5f} "
+          f"1/sqrt(alpha_bar_T)={1.0 / math.sqrt(abT):.3f}")
+    print(f"  [real stats] std={real_std:.4f} median_r={real_med:.4f} "
+          f"mean_r={real_mean:.4f} p95_r={real_p95:.4f} max_r={real_max:.4f} "
+          f"(n={tot_real_n})")
+    print(f"  [probe] {probe_labels.shape[0]} 固定节点 (32/类), 固定 initial "
+          f"noise, checkpoint: R0/R1/R3/R5 + 每 5 轮")
+    # R0 (初始化) raw probe: 训练前基线 (residual skip 下未训练网络是否已不爆炸)
+    generator.eval()
+    probe_rng.manual_seed(args.seed + 9173)   # reverse 噪声流, 与 initial noise (seed+4242) 独立
+    with torch.no_grad():
+        raw_probe0 = generator.sample(
+            labels=probe_labels, device=device,
+            apply_output_bound=False, initial_noise=probe_noise,
+            noise_generator=probe_rng)
+    r0_probe = torch.linalg.vector_norm(raw_probe0, ord=2, dim=1)
+    longitudinal.append({
+        'round': 0, 'approx_local_steps': 0,
+        'raw_std': float(raw_probe0.std().item()),
+        'raw_median_r': float(r0_probe.median().item()),
+        'raw_mean_r': float(r0_probe.mean().item()),
+        'raw_p95_r': float(torch.quantile(r0_probe, 0.95).item()),
+        'raw_max_r': float(r0_probe.max().item()),
+        'radius_vs_real': round(float(r0_probe.median().item())
+                                / max(real_med, 1e-12), 1),
+        'std_vs_real': round(float(raw_probe0.std().item())
+                             / max(real_std, 1e-12), 1)})
+    print(f"    [LONG] r0 (初始化): raw σ={longitudinal[0]['raw_std']:.2f} "
+          f"median_r={longitudinal[0]['raw_median_r']:.1f} "
+          f"r/real={longitudinal[0]['radius_vs_real']}x")
+
     bs = args.diffusion_pretrain_batch
     for rnd in range(args.diffusion_pretrain_rounds):
-        states, weights, losses = [], [], []
+        states, weights = [], []
         base_state = {k: v.detach().clone() for k, v in generator.state_dict().items()}
-        for ci, x, y in client_data:
+        before, after = [], []
+        local_train_mse = 0.0
+        local_train_n = 0
+        steps_this_round = 0
+        for (ci, x, y), dg in zip(client_data, diag):
             local_gen = copy.deepcopy(generator)
             local_gen.load_state_dict(base_state)
             local_gen.train()
             opt = _Adam(local_gen.parameters(), lr=args.diffusion_pretrain_lr)
             n = x.shape[0]
-            ep_loss = 0.0
+            # A. global_before (下发模型在本地固定 diag 上)
+            b_mse, _ = _diag_eval(local_gen, dg)
+            before.append(b_mse)
+            # 本地训练 (按实际样本数加权统计, 修复旧口径 ÷epochs 的虚高)
             for _ep in range(args.diffusion_pretrain_epochs):
                 perm = torch.randperm(n, device=device)
                 for s in range(0, n, bs):
@@ -1340,13 +1777,17 @@ def federated_diffusion_pretrain(generator, subgraphs, args, device):
                     loss = local_gen.denoise_loss(x[idx], y[idx])
                     loss.backward()
                     opt.step()
-                    ep_loss += loss.item()
+                    local_train_mse += loss.item() * idx.numel()
+                    local_train_n += idx.numel()
+                    steps_this_round += 1
+            # B. local_after (同一 diag 上)
+            a_mse, _ = _diag_eval(local_gen, dg)
+            after.append(a_mse)
             states.append({k: v.detach().clone()
                            for k, v in local_gen.state_dict().items()})
             weights.append(float(n))
-            losses.append(ep_loss / max(1, args.diffusion_pretrain_epochs))
             del local_gen, opt
-        # 服务端加权聚合 (FedAvg over denoiser weights)
+        # 服务端加权聚合 (FedAvg over denoiser state_dict; buffer 均相同, 平均不改变)
         tot_w = sum(weights)
         new_state = {}
         for k in states[0]:
@@ -1356,10 +1797,291 @@ def federated_diffusion_pretrain(generator, subgraphs, args, device):
                 acc = term if acc is None else acc + term
             new_state[k] = acc.to(generator.state_dict()[k].dtype)
         generator.load_state_dict(new_state)
-        print(f"    [扩散预训练] round {rnd}: 平均去噪损失={sum(losses)/len(losses):.5f}")
+        # C. aggregated_global: 每客户端在本地 diag 上评估新全局模型 (只上报标量)
+        generator.eval()
+        agg_vals, agg_ns, agg_buckets = [], [], {k: [] for k in bucket_defs}
+        for dg in diag:
+            m, bm = _diag_eval(generator, dg)
+            agg_vals.append(m)
+            agg_ns.append(dg[1].shape[0])
+            for k in bucket_defs:
+                agg_buckets[k].append(bm[k])
+        w_before = _weighted(before, [d[1].shape[0] for d in diag])
+        w_after = _weighted(after, [d[1].shape[0] for d in diag])
+        w_agg = _weighted(agg_vals, agg_ns)
+        local_gain = w_before - w_after
+        agg_gain = w_before - w_agg
+        agg_gap = w_agg - w_after
+        retention = (agg_gain / (local_gain + 1e-12)
+                     if local_gain > 1e-4 else float('nan'))
+        rec = {'round': rnd,
+               'weighted_global_before': round(w_before, 5),
+               'weighted_local_after': round(w_after, 5),
+               'weighted_aggregated_global': round(w_agg, 5),
+               'local_gain': round(local_gain, 5),
+               'aggregation_gain': round(agg_gain, 5),
+               'aggregation_gap': round(agg_gap, 5),
+               'aggregation_retention': (round(retention, 4)
+                                         if not math.isnan(retention) else None),
+               'local_train_mse': round(local_train_mse / max(local_train_n, 1), 5),
+               'agg_bucket_mse': {k: round(_weighted(
+                   [v for v in agg_buckets[k] if not math.isnan(v)],
+                   [ns for v, ns in zip(agg_buckets[k], agg_ns)
+                    if not math.isnan(v)]), 5)
+                   if any(not math.isnan(v) for v in agg_buckets[k]) else None
+                   for k in bucket_defs},
+               'per_client': {
+                   str(ci): {'n_diag': dg[1].shape[0],
+                             'before': round(before[i], 5),
+                             'after': round(after[i], 5),
+                             'improvement': round(before[i] - after[i], 5),
+                             'improvement_pct': round(
+                                 (before[i] - after[i]) / max(before[i], 1e-12)
+                                 * 100, 2)}
+                   for i, (ci, dg) in enumerate(
+                       zip([c for c, _, _ in client_data], diag))}}
+        s2_records.append(rec)
+        print(f"  [扩散预训练] round {rnd}: 样本加权平均去噪损失="
+              f"{rec['local_train_mse']:.5f}")
+        print(f"    [S2] before={w_before:.5f} local_after={w_after:.5f} "
+              f"agg_global={w_agg:.5f} | local_gain={local_gain:.5f} "
+              f"agg_gain={agg_gain:.5f} gap={agg_gap:.5f} "
+              f"retention={rec['aggregation_retention']}")
+        print(f"    [S2] agg buckets: early={rec['agg_bucket_mse']['early']} "
+              f"mid={rec['agg_bucket_mse']['mid']} "
+              f"late={rec['agg_bucket_mse']['late']}")
+        pc = rec['per_client']
+        cids = sorted(pc, key=lambda k: pc[k]['improvement'])
+        best_c = pc[cids[-1]] if cids else None
+        worst_c = pc[cids[0]] if cids else None
+        print(f"    [S2] 客户端明细 ({len(pc)} 个, 全量见 diffusion_s2_diag.json): "
+              f"最优 c{cids[-1]} {best_c['before']:.3f}→{best_c['after']:.3f} "
+              f"(+{best_c['improvement']:.4f}), "
+              f"最差 c{cids[0]} {worst_c['before']:.3f}→{worst_c['after']:.3f} "
+              f"(+{worst_c['improvement']:.4f})")
+        if args.checkpoint_dir:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            with open(os.path.join(args.checkpoint_dir,
+                                   'diffusion_s2_diag.json'), 'w') as f:
+                json.dump(s2_records, f, indent=1)
+        # ---- 纵向 raw-sampling checkpoint (R1/R3 + 每 5 轮 + gate 集 + 末轮): 固定 labels + 固定噪声 ----
+        total_steps += steps_this_round
+        rnd_label = args.diffusion_pretrain_resume_round + rnd + 1
+        if ((rnd_label) in (8, 10, 12, 15, 18) or (rnd + 1) in (1, 3)
+                or (rnd + 1) % 5 == 0
+                or rnd == args.diffusion_pretrain_rounds - 1):
+            generator.eval()
+            probe_rng.manual_seed(args.seed + 9173)   # 重置: 同噪声流跨 checkpoint 可比
+            # (与 initial noise 的 seed+4242 独立, Bug 7)
+            with torch.no_grad():
+                raw_probe = generator.sample(
+                    labels=probe_labels, device=device,
+                    apply_output_bound=False, initial_noise=probe_noise,
+                    noise_generator=probe_rng)
+            r_probe = torch.linalg.vector_norm(raw_probe, ord=2, dim=1)
+            probe = {
+                'round': rnd_label,
+                'approx_local_steps': total_steps // len(client_data),
+                'diag_mse': rec['weighted_aggregated_global'],
+                'mse_zero_ratio': round(rec['weighted_aggregated_global']
+                                        / max(zero_base, 1e-12), 4),
+                'early_mse': rec['agg_bucket_mse']['early'],
+                'mid_mse': rec['agg_bucket_mse']['mid'],
+                'late_mse': rec['agg_bucket_mse']['late'],
+                'raw_std': float(raw_probe.std().item()),
+                'raw_median_r': float(r_probe.median().item()),
+                'raw_mean_r': float(r_probe.mean().item()),
+                'raw_p95_r': float(torch.quantile(r_probe, 0.95).item()),
+                'raw_max_r': float(r_probe.max().item()),
+                'radius_vs_real': round(float(r_probe.median().item())
+                                        / max(real_med, 1e-12), 1),
+                'std_vs_real': round(float(raw_probe.std().item())
+                                     / max(real_std, 1e-12), 1),
+            }
+            if rnd_label in (1, 5):
+                probe['reverse_traj'] = reverse_norm_trajectory(
+                    generator, probe_labels, probe_noise, probe_rng, device)
+            if getattr(generator, 'skip_mode', 'none') == 'timestep_scalar':
+                with torch.no_grad():
+                    ct = torch.exp(generator.skip_log_scale.weight).squeeze(-1)
+                T_ct = ct.numel()
+                probe['c_stats'] = {
+                    'min': float(ct.min().item()),
+                    'max': float(ct.max().item()),
+                    'mean_early': float(ct[:T_ct // 3].mean().item()),
+                    'mean_mid': float(ct[T_ct // 3:2 * T_ct // 3].mean().item()),
+                    'mean_late': float(ct[2 * T_ct // 3:].mean().item()),
+                }
+                if ct.max().item() > 2.0:
+                    print(f"  ⚠ [skip-gate] max c(t)={ct.max().item():.3f} > 2, "
+                          f"scalar gate 可能开始走新的幅度路径")
+                c_extra = (f" c_early={probe['c_stats']['mean_early']:.3f} "
+                           f"c_late={probe['c_stats']['mean_late']:.3f}")
+            else:
+                c_extra = ""
+            longitudinal.append(probe)
+            print(f"    [LONG] r{rnd_label}: diag_mse={probe['diag_mse']:.4f} "
+                  f"(x{probe['mse_zero_ratio']}) raw σ={probe['raw_std']:.2f} "
+                  f"median_r={probe['raw_median_r']:.1f} "
+                  f"p95_r={probe['raw_p95_r']:.1f} "
+                  f"r/real={probe['radius_vs_real']}x "
+                  f"σ/real={probe['std_vs_real']}x{c_extra}")
+            if args.checkpoint_dir:
+                with open(os.path.join(args.checkpoint_dir,
+                                       'diffusion_longitudinal_diag.json'),
+                          'w') as f:
+                    json.dump(longitudinal, f, indent=1)
+                # 每个 gate 单独保存 denoiser (R18/R20 等均保留, 不互相覆盖)
+                torch.save(generator.state_dict(),
+                           os.path.join(args.checkpoint_dir,
+                                        f'pretrained_generator_r{rnd_label}.pt'))
     print(f"  [联邦扩散预训练] 完成. 去噪器已学到真实特征分布; "
           f"后续反向采样将以真实分布为先验")
     return generator
+
+
+# =========================================================================
+#  pretrained-manifold 约束: radius bank + 参数锚 + 诊断
+#  (堵住"放大伪特征幅度以增大 KL 分歧"的作弊路径)
+# =========================================================================
+
+@torch.no_grad()
+def build_pretrain_radius_bank(generator, num_classes, device, bank_size=64,
+                               rng_seed=None):
+    """
+    预训练完成后, 按类别从 pretrained DDPM 的 **raw** 采样建 radius bank。
+    r_c 分布来自联邦扩散预训练本身 (专利 S3.2 的流形约束实现),
+    不从对抗期的 fake batch 估计, 也不需要客户端 μ/σ 上传。
+    每类只存 bank_size 个标量, 显存可忽略。返回 [num_classes, bank_size]。
+
+    rng_seed 非 None 时用专用 generator (不消耗全局 RNG), 保证 Stage2 入口
+    不影响 classifier 轨迹的 RNG 流 (paired-arm 身份一致性)。
+    """
+    banks = []
+    for c in range(num_classes):
+        labels = torch.full((bank_size,), c, dtype=torch.long, device=device)
+        if rng_seed is None:
+            raw_x = generator.sample(labels=labels, device=device,
+                                     apply_output_bound=False)
+        else:
+            g0 = torch.Generator(device=device).manual_seed(rng_seed + c)
+            g1 = torch.Generator(device=device).manual_seed(rng_seed + 1000 + c)
+            init_noise = torch.randn(bank_size, generator.feat_dim,
+                                     generator=g0, device=device)
+            raw_x = generator.sample(labels=labels, device=device,
+                                     apply_output_bound=False,
+                                     initial_noise=init_noise,
+                                     noise_generator=g1)
+        radius = torch.linalg.vector_norm(raw_x, ord=2, dim=1)
+        lo = torch.quantile(radius, 0.05)
+        hi = torch.quantile(radius, 0.95)
+        banks.append(radius.clamp(lo, hi))
+    return torch.stack(banks).detach()
+
+
+def project_to_pretrain_radius(raw_x, labels, radius_bank, eps=1e-12):
+    """
+    硬流形投影 x = r_c * z / ||z||:
+      - target_radius 来自 bank (frozen)
+      - current_radius **不 detach** —— 保留真实 Jacobian
+        d(z/||z||)/dz = (I - u u^T) / ||z||,
+        径向分量被投影掉 (z -> a·z 不改变 x, 幅度作弊失去自由度),
+        切向(语义)梯度完整保留。
+    """
+    B = raw_x.shape[0]
+    M = radius_bank.shape[1]
+    bank_idx = torch.arange(B, device=raw_x.device) % M
+    target_radius = radius_bank[labels, bank_idx].unsqueeze(1)
+    current_radius = torch.sqrt(raw_x.pow(2).sum(dim=1, keepdim=True) + eps)
+    return raw_x * (target_radius / current_radius)
+
+
+def diffusion_prior_anchor_loss(model, ref, eps=1e-8):
+    """
+    相对 L2-SP: 把生成器参数锚定在联邦预训练结束时的 θ_pre,
+    防止对抗精调把预训练学到的 score field / 数据 prior 洗掉。
+    L_anchor = mean_k [ ||θ_k - θ_pre,k||² / mean(θ_pre,k²) ] (逐参数相对化)
+    """
+    terms = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue   # 冻结参数 (如 c(t)) 不进 anchor, 避免恒 0 项
+        p0 = ref[name]
+        denom = p0.pow(2).mean().detach().clamp_min(eps)
+        terms.append((p - p0).pow(2).mean() / denom)
+    return torch.stack(terms).mean()
+
+
+@torch.no_grad()
+def compute_theta_drift(model, ref, eps=1e-8):
+    """theta_drift = ||θ - θ_pre|| / ||θ_pre|| —— 对抗精调离预训练 prior 多远。"""
+    num = 0.0
+    den = 0.0
+    for name, p in model.named_parameters():
+        p0 = ref[name]
+        num += (p - p0).pow(2).sum().item()
+        den += p0.pow(2).sum().item()
+    return (num / (den + eps)) ** 0.5
+
+
+@torch.no_grad()
+def reverse_norm_trajectory(generator, labels, initial_noise, noise_generator,
+                            device):
+    """
+    逐 reverse step 记录 ||x_t|| 分布 (mean/median/p95) —— 定位发散从哪几步开始。
+    仅诊断用; 需在调用前重置 noise_generator 种子以保持跨 checkpoint 可比。
+    """
+    traj = []
+    x_t = initial_noise.clone()
+    num_steps = generator.num_steps
+    for t in reversed(range(num_steps)):
+        r = torch.linalg.vector_norm(x_t, ord=2, dim=1)
+        traj.append({'t': int(t),
+                     'mean': float(r.mean().item()),
+                     'median': float(r.median().item()),
+                     'p95': float(torch.quantile(r, 0.95).item())})
+        x_t = generator._reverse_step(x_t, t, labels, num_steps,
+                                      noise_generator=noise_generator)
+    return traj
+
+
+@torch.no_grad()
+def pretrain_only_diagnostics(generator, local_models, global_model,
+                              num_classes, device, normalized_ckr,
+                              fake_nodes=128, knn_k=8,
+                              initial_noise=None, noise_generator=None):
+    """
+    联邦预训练刚结束(对抗更新之前)的健康检查:
+    raw 采样分布统计 + 该分布下 teacher/global 的 L_sem / L_dis。
+    用于区分两种根因:
+      情况A: 预训练后分布健康, 对抗精调把它冲掉  -> radius+anchor 对症
+      情况B: 预训练本身没学到位(raw 已严重偏离真实分布) -> 先查调度/采样
+    initial_noise/noise_generator: 可选, 传入固定噪声时不消耗全局 RNG
+    (Stage2 paired-arm 身份一致性)。
+    返回 dict (调用方落盘)。
+    """
+    labels = torch.arange(num_classes, device=device).repeat_interleave(
+        max(1, fake_nodes // num_classes))
+    labels = labels[:fake_nodes]
+    raw_x = generator.sample(labels=labels, device=device,
+                             apply_output_bound=False,
+                             initial_noise=initial_noise,
+                             noise_generator=noise_generator)
+    fake_graph = build_knn_graph(raw_x, k=min(knn_k, raw_x.shape[0] - 1))
+    L_sem = compute_generator_semantic_loss(
+        fake_graph, labels, local_models, normalized_ckr, num_classes, device)
+    L_dis = compute_generator_disagreement_loss(
+        fake_graph, labels, local_models, global_model, normalized_ckr,
+        num_classes, device, loss_type='kl')
+    r = torch.linalg.vector_norm(raw_x, ord=2, dim=1)
+    return {
+        'raw_mu': float(raw_x.mean().item()),
+        'raw_std': float(raw_x.std().item()),
+        'raw_radius_mean': float(r.mean().item()),
+        'raw_radius_std': float(r.std().item()),
+        'L_sem': float(L_sem.item()),
+        'L_dis': float(L_dis.item()),
+    }
 
 
 def compute_global_feature_stats(subgraphs, device):
@@ -1651,7 +2373,8 @@ def compute_student_distillation_loss(fake_graph, fake_labels,
         if loss_type == 'l1':
             teacher_logits = [model_k(fake_graph) for model_k in local_models]
         else:
-            teacher_probs = [F.softmax(model_k(fake_graph), dim=-1).clamp(min=1e-8)
+            teacher_probs = [F.softmax(model_k(fake_graph) / temperature,
+                                       dim=-1).clamp(min=1e-8)
                              for model_k in local_models]
 
     for c in range(num_classes):
@@ -1787,6 +2510,16 @@ def evaluate_global(global_model, subgraphs, task_mode, split='val', device=None
 # =====================================================================
 
 def main():
+    if getattr(args, 'formal_campaign_guard', False):
+        validate_formal_campaign(args)
+    if getattr(args, 'formal_multiclass_protocol_guard', False):
+        validate_formal_protocol(args)
+    validate_run_args(args)   # Bug 3/4/9: 互斥 CLI 组合 fail-fast
+    if getattr(args, 'deterministic_torch', False):
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print("  [Deterministic] torch 确定性模式开启")
     seed_everything(seed=args.model_seed)
     t_total0 = time.time()
 
@@ -2040,6 +2773,9 @@ def main():
 
     # ---- 生成器 ----
     distill_feat_dim = feat_dim
+    diffusion_skip_mode = args.diffusion_skip_mode
+    if diffusion_skip_mode == 'none' and args.diffusion_residual_skip:
+        diffusion_skip_mode = 'fixed'   # 兼容旧 flag
     generator = ConditionalDiffusionGenerator(
         feat_dim=distill_feat_dim,
         num_classes=num_classes,
@@ -2048,9 +2784,16 @@ def main():
         beta_start=args.diffusion_beta_start,
         beta_end=args.diffusion_beta_end,
         output_bound=args.generator_output_bound,
+        skip_mode=diffusion_skip_mode,
+        use_posterior_variance=args.use_posterior_variance,
     ).to(device)
+    # 生成器不适用普通 weight decay (θ→0 会把预训练 prior 也拉向 0);
+    # prior 保持由 --lambda_diffusion_anchor 的 L2-SP (θ→θ_pre) 显式负责。
     gen_optimizer = Adam(generator.parameters(), lr=args.generator_lr,
-                         weight_decay=args.weight_decay)
+                         weight_decay=0.0)
+    if args.paired_rng_diag:
+        print(f"  [PairedRNG] P0 (模型初始化后): rng={_rng_fingerprint()} "
+              f"classifier={_model_param_hash(global_model)}")
     global_optimizer = Adam(global_model.parameters(), lr=args.distill_lr,
                             weight_decay=args.weight_decay)
 
@@ -2265,15 +3008,33 @@ def main():
                          num_steps=args.diffusion_steps,
                          beta_start=args.diffusion_beta_start,
                          beta_end=args.diffusion_beta_end,
-                         output_bound=args.generator_output_bound)
+                         output_bound=args.generator_output_bound,
+                         skip_mode=diffusion_skip_mode,
+                         use_posterior_variance=args.use_posterior_variance)
 
     start_round = 0
     best_val_primary = 0.0
     best_test_primary = 0.0
     best_round = -1
+    pretrain_ref = None     # 联邦预训练后的参数锚 (L2-SP)
+    radius_bank = None      # 预训练 radius bank [num_classes, bank_size]
     if args.resume_checkpoint:
         assert os.path.exists(args.resume_checkpoint), \
             f"--resume_checkpoint 不存在: {args.resume_checkpoint}"
+        # Bug 2: 先按 checkpoint 记录的 freeze 策略重建 gen_optimizer 参数组,
+        # 再 load optimizer state (避免 14/14 组 optimizer 装 13/14 组 state)
+        # Bug A: checkpoint 与当前 CLI 的 freeze 策略不一致时 fail-fast
+        ckpt_peek = torch.load(args.resume_checkpoint, map_location='cpu',
+                               weights_only=False)
+        saved_args = ckpt_peek.get('args') or {}
+        freeze_policy = resolve_resume_freeze_policy(
+            saved_args, args.diffusion_freeze_skip_scale)
+        configure_generator_trainability(
+            generator, True, freeze_skip_scale=freeze_policy)
+        gen_optimizer = Adam([p for p in generator.parameters()
+                              if p.requires_grad],
+                             lr=args.generator_lr, weight_decay=0.0)
+        del ckpt_peek
         ckpt = load_checkpoint(
             args.resume_checkpoint,
             global_model=global_model,
@@ -2281,6 +3042,7 @@ def main():
             global_optimizer=global_optimizer,
             gen_optimizer=gen_optimizer,
             ckr_tracker=tracker,
+            local_optimizers=local_optimizers,
             expected_meta={'task_mode': args.task_mode,
                            'num_classes': num_classes,
                            'feat_dim': feat_dim},
@@ -2288,8 +3050,37 @@ def main():
         start_round = int(ckpt['round']) + 1
         best_val_primary = float(ckpt.get('best_metric', 0.0))
         best_round = int(ckpt['round'])
+        # Bug 10: generator config 校验 (meta 存在时逐项核对, 缺失时依赖
+        # strict state_dict + expected_meta 的缓冲校验)
+        saved_cfg = (ckpt.get('meta') or {}).get('generator_cfg')
+        if saved_cfg:
+            validate_generator_cfg(saved_cfg, generator_cfg)
+        else:
+            print("  [Resume] legacy checkpoint: 无 generator_cfg metadata, "
+                  "由 strict state_dict 加载保证一致性")
+        # Bug 5: persistent 模式下本地 optimizer 状态必须存在, 否则 fail-fast
+        if (args.local_optimizer_lifecycle == 'persistent'
+                and ckpt.get('local_optimizer_states') is None
+                and not args.allow_legacy_resume_without_local_optimizer_state):
+            raise RuntimeError(
+                "persistent local optimizer 模式的 checkpoint 缺少 "
+                "local_optimizer_states, resume 后的训练轨迹与连续训练不一致。"
+                "如需兼容旧 checkpoint, 显式加 "
+                "--allow_legacy_resume_without_local_optimizer_state")
+        if (ckpt.get('local_optimizer_states') is None
+                and args.allow_legacy_resume_without_local_optimizer_state):
+            print("  [Resume] legacy checkpoint: 本地 optimizer 状态缺失, "
+                  "已显式允许 (轨迹可能与连续训练不同)")
+        # 恢复 pretrained-manifold 约束状态 (避免 resume 后重建一个不同的 prior)
+        if ckpt.get('pretrain_ref'):
+            pretrain_ref = {k: v.to(device)
+                            for k, v in ckpt['pretrain_ref'].items()}
+        if ckpt.get('radius_bank') is not None:
+            radius_bank = ckpt['radius_bank'].to(device)
         print(f"[Resume] 从 round {start_round} 继续训练 "
-              f"(先前最佳 metric={best_val_primary:.4f})")
+              f"(先前最佳 metric={best_val_primary:.4f}, "
+              f"pretrain_ref={'有' if pretrain_ref else '无'}, "
+              f"radius_bank={'有' if radius_bank is not None else '无'})")
 
     # =================================================================
     #  主循环
@@ -2309,12 +3100,111 @@ def main():
               f"μ 均值={g_feat_mu.mean():.5f} σ 均值={g_feat_std.mean():.5f} "
               f"(客户端仅上行 2×{g_feat_mu.numel()} 个统计量, 未上传原始特征)")
 
+    # ---- Stage 2 入口: 从 healthy pretrained checkpoint 初始化 ----
+    # 只加载 generator 权重 (校验配置一致性), 不恢复预训练 Adam 状态;
+    # θ_pre / radius bank 均取自加载后的状态, 对抗期 optimizer 全新重建。
+    if getattr(args, 'diffusion_pretrained_checkpoint', ''):
+        pretrain_ref, radius_bank, gen_optimizer = init_stage2_from_pretrained(
+            generator, args.diffusion_pretrained_checkpoint, args, device,
+            num_classes)
+        # R0 基线 (任何对抗更新前); 用专用固定噪声, 不消耗全局 RNG (paired-arm 一致)
+        try:
+            diag_ckr = normalize_ckr_safe(tracker.static_ckr_scaled)
+        except Exception:
+            diag_ckr = (torch.ones(args.num_clients, num_classes,
+                                   device=device) / args.num_clients)
+        _fn = (128 // num_classes) * num_classes
+        _dg0 = torch.Generator(device=device).manual_seed(args.seed + 8888)
+        _dg1 = torch.Generator(device=device).manual_seed(args.seed + 9999)
+        _dn = torch.randn(_fn, generator.feat_dim, generator=_dg0,
+                          device=device)
+        d0 = pretrain_only_diagnostics(generator, local_models, global_model,
+                                       num_classes, device, diag_ckr,
+                                       fake_nodes=_fn,
+                                       initial_noise=_dn,
+                                       noise_generator=_dg1)
+        print(f"  [Stage2 R0 基线] raw μ={d0['raw_mu']:.4f} "
+              f"σ={d0['raw_std']:.4f} r={d0['raw_radius_mean']:.4f} "
+              f"L_sem={d0['L_sem']:.4f} L_dis={d0['L_dis']:.4f}")
+
     # ---- 联邦扩散预训练: 客户端本地训练去噪网络, 只上行参数 (专利 S3.1/S3.2 + 专利权1) ----
-    if getattr(args, 'federated_diffusion_pretrain', False):
+    # resume 时**不得**重复预训练: 恢复的 generator/optimizer 已含对抗期状态,
+    # 再预训练会用新 prior 覆盖参数但 Adam 动量仍是旧的 (不一致)。
+    if getattr(args, 'federated_diffusion_pretrain', False) and start_round == 0:
         print("\n" + "=" * 60)
         print("[联邦扩散预训练] 让去噪网络真正学到真实特征分布")
         print("=" * 60)
         federated_diffusion_pretrain(generator, subgraphs, args, device)
+
+        # ---- pretrained-manifold 约束构建 (对抗期使用) ----
+        pretrain_ref = {name: p.detach().clone()
+                        for name, p in generator.named_parameters()}
+        if args.radius_constraint:
+            radius_bank = build_pretrain_radius_bank(
+                generator, num_classes, device, args.radius_bank_size)
+            r_mean = radius_bank.mean().item()
+            r_std = radius_bank.std().item()
+            print(f"  [Radius Bank] 每类 {args.radius_bank_size} 个样本, "
+                  f"全局 r 均值={r_mean:.4f} σ={r_std:.4f} "
+                  f"(冻结, 对抗期 fake_x = r_c·z/‖z‖)")
+
+        # ---- pretrain-only 健康检查 (分级验证 Stage 1) ----
+        try:
+            diag_ckr = normalize_ckr_safe(tracker.static_ckr_scaled)
+        except Exception:
+            diag_ckr = (torch.ones(args.num_clients, num_classes,
+                                   device=device) / args.num_clients)
+        diag = pretrain_only_diagnostics(
+            generator, local_models, global_model, num_classes, device,
+            diag_ckr)
+        print(f"  [Pretrain-Only 诊断] raw μ={diag['raw_mu']:.4f} "
+              f"σ={diag['raw_std']:.4f} r={diag['raw_radius_mean']:.4f}±"
+              f"{diag['raw_radius_std']:.4f} L_sem={diag['L_sem']:.4f} "
+              f"L_dis={diag['L_dis']:.4f}")
+        if args.checkpoint_dir:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            with open(os.path.join(args.checkpoint_dir, 'pretrain_diag.json'),
+                      'w') as f:
+                json.dump(diag, f, indent=1)
+        if args.pretrain_diagnostic_only:
+            if args.checkpoint_dir:
+                os.makedirs(args.checkpoint_dir, exist_ok=True)
+                torch.save(generator.state_dict(),
+                           os.path.join(args.checkpoint_dir,
+                                        'pretrained_generator.pt'))
+                print(f"  [Pretrain-Only] generator 已保存: "
+                      f"{os.path.join(args.checkpoint_dir, 'pretrained_generator.pt')}")
+                if getattr(generator, 'skip_mode', 'none') == 'timestep_scalar':
+                    with torch.no_grad():
+                        ct = torch.exp(generator.skip_log_scale.weight).squeeze(-1)
+                    json.dump({str(i): float(v) for i, v in enumerate(ct.cpu())},
+                              open(os.path.join(
+                                  args.checkpoint_dir,
+                                  'learned_skip_coefficients.json'), 'w'))
+            print("\n[Pretrain-Only 诊断模式] 不进入对抗主循环, 正常退出。")
+            print("PRETRAIN_DIAG_ONLY_DONE")
+            return 0
+
+    use_radius_proj = bool(args.radius_constraint and radius_bank is not None)
+    if args.radius_constraint and radius_bank is None:
+        print("  ⚠ [Radius] --radius_constraint 开但 radius_bank 缺失 "
+              "(预训练被关闭或旧 checkpoint 无 bank), 回退到 output_bound 路径")
+    if args.paired_rng_diag:
+        print(f"  [PairedRNG] P1 (Stage2 初始化后, 本地训练前): "
+              f"rng={_rng_fingerprint()} classifier={_model_param_hash(global_model)}")
+        _data_h = hashlib.md5()
+        for _i in range(args.num_clients):
+            with open(f"dataset/{args.dataset}/Client{args.num_clients}/"
+                      f"Louvain/data{_i}.pt", 'rb') as _f:
+                _data_h.update(_f.read())
+        _ck_h = 'None'
+        if getattr(args, 'diffusion_pretrained_checkpoint', ''):
+            with open(args.diffusion_pretrained_checkpoint, 'rb') as _f:
+                _ck_h = hashlib.md5(_f.read()).hexdigest()[:12]
+        print(f"  [PairedID] data_hash={_data_h.hexdigest()[:12]} "
+              f"init={_model_param_hash(global_model)} ckpt={_ck_h} "
+              f"rng_protocol=v2(reseed+dedicated) "
+              f"server_start_round={args.server_start_round}")
 
     for round_id in range(start_round, args.num_rounds):
         t_round0 = time.time()
@@ -2327,6 +3217,24 @@ def main():
                 args, round_id, local_optimizers, gen_optimizer, global_optimizer)
         _emit_event(args, 'round_started', round_id=round_id, stage='client_training')
 
+        # ---- [RoundStart 诊断] 本轮任何本地训练前 val + θ 快照 (T0) ----
+        if args.federated_mode == 'fedavg':
+            _was_tr = global_model.training
+            global_model.eval()
+            with torch.no_grad():
+                _vs_res = evaluate_global(global_model, subgraphs,
+                                          args.task_mode, split='val',
+                                          device=device)
+            if _was_tr:
+                global_model.train()
+            _vs = (float(_vs_res.get('accuracy', float('nan')))
+                   if isinstance(_vs_res, dict) else float('nan'))
+            theta_start = [p.detach().clone() for p in global_model.parameters()]
+            print(f"  [RoundStart] val={_vs:.4f} (本轮本地训练前)")
+        else:
+            _vs = float('nan')
+            theta_start = None
+
         # -----------------------------------------------------------
         #  [1] 广播全局模型 -> [2] 客户端 fit_idx 本地训练
         # -----------------------------------------------------------
@@ -2335,12 +3243,16 @@ def main():
         aug_edge_indices = []
         if args.contrastive_mode == 'subgraph_cross_view':
             for ci in range(args.num_clients):
+                reseed_client_rng(args, round_id, ci)   # 客户端随机流确定性解耦
                 aug_ei = edge_perturbation(
                     subgraphs[ci].edge_index,
                     subgraphs[ci].x.shape[0],
                     args.edge_perturb_ratio,
                 )
                 aug_edge_indices.append(aug_ei.to(device))
+                if args.paired_rng_diag and ci == 0 and round_id == 0:
+                    print(f"  [PairedRNG] client0 aug_edge hash="
+                          f"{_tensor_hash(aug_ei)}")
 
         round_ce_loss = 0.0
         round_cl_loss = 0.0
@@ -2352,6 +3264,12 @@ def main():
             # 广播全局模型
             for ci in range(args.num_clients):
                 local_models[ci].load_state_dict(global_model.state_dict())
+            if args.local_optimizer_lifecycle == 'reset_each_round':
+                # Bug 5: 每轮广播后重建本地 optimizer, 不继承上轮 Adam 动量
+                local_optimizers = [
+                    Adam(local_models[ci].parameters(), lr=args.lr,
+                         weight_decay=args.weight_decay)
+                    for ci in range(args.num_clients)]
 
         # 锚点采样: random_each_epoch / fixed_per_round (轮内固定) / fixed_global (全程固定)
         round_anchors = {}
@@ -2370,12 +3288,16 @@ def main():
                 global_anchors[ci] = pool[perm]
 
         for ci in range(args.num_clients):
+            reseed_client_rng(args, round_id, ci)   # 客户端随机流确定性解耦
             local_models[ci].train()
             data = subgraphs[ci]
 
             _cli_ce_sum = 0.0
             _cli_cl_sum = 0.0
             _cli_cl_cnt = 0
+            if args.paired_rng_diag and ci == 0 and round_id == 0:
+                print(f"  [PairedRNG] P2 (client0 训练前): rng={_rng_fingerprint()} "
+                      f"local0={_model_param_hash(local_models[0])}")
             for epoch_id in range(args.num_epochs):
                 local_optimizers[ci].zero_grad()
 
@@ -2424,6 +3346,11 @@ def main():
                         rwr_seed=args.rwr_seed,
                         cache_scope=args.rwr_cache_scope,
                     )
+                    if (args.paired_rng_diag and ci == 0 and round_id == 0
+                            and epoch_id == 0):
+                        print(f"  [PairedRNG] client0 epoch0 anchors="
+                              f"{_tensor_hash(anchors)} ce={ce_loss.item():.6f} "
+                              f"cl={cl_loss.item():.6f}")
                     loss = loss + args.lambda_subgraph * cl_loss
                     round_cl_loss += cl_loss.item()
                     round_cl_count += 1
@@ -2432,12 +3359,20 @@ def main():
 
                 loss.backward()
                 local_optimizers[ci].step()
+                if (args.paired_rng_diag and ci == 0 and round_id == 0
+                        and epoch_id == 0):
+                    print(f"  [PairedRNG] client0 epoch0 后 local0="
+                          f"{_model_param_hash(local_models[0])} "
+                          f"rng={_rng_fingerprint()}")
                 if math.isnan(loss.item()) or _nan_diag([local_models[ci]],
                                                         f'client{ci}_train'):
                     print(f"  [NAN-DIAG] round {round_id} client {ci} "
                           f"训练后出现 NaN (ce={ce_loss.item():.4f})")
                 round_ce_loss += ce_loss.item()
                 _cli_ce_sum += ce_loss.item()
+            if args.paired_rng_diag and ci == 0 and round_id == 0:
+                print(f"  [PairedRNG] P3 (client0 训练后): rng={_rng_fingerprint()} "
+                      f"local0={_model_param_hash(local_models[0])}")
 
             # ---- 平台集成: 客户端训练结构化事件 ----
             fit_y = data.y[data.fit_idx]
@@ -2660,17 +3595,79 @@ def main():
                         else:
                             gp.data.add_(w * lp.data)
             print(f"  聚合 {args.num_clients} 个客户端, 初始全局模型已生成")
+            if args.paired_rng_diag and round_id == 0:
+                print(f"  [PairedRNG] P4 (After FedAvg): rng={_rng_fingerprint()} "
+                      f"global={_model_param_hash(global_model)}")
+            # ---- [Drift 诊断] 本地更新范数 vs 轮起始全局模型 ----
+            if theta_start is not None:
+                gup = math.sqrt(sum(
+                    ((gp - ts) ** 2).sum().item()
+                    for gp, ts in zip(global_model.parameters(), theta_start)))
+                cup = [math.sqrt(sum(
+                    ((lp - ts) ** 2).sum().item()
+                    for lp, ts in zip(local_models[ci].parameters(),
+                                      theta_start)))
+                    for ci in range(args.num_clients)]
+                cup_sorted = sorted(cup)
+                cup_mean = sum(cup) / len(cup)
+                cup_med = cup_sorted[len(cup) // 2]
+                cup_p95 = cup_sorted[int(len(cup) * 0.95) - 1]
+                cup_max = cup_sorted[-1]
+                th_norm = math.sqrt(sum((ts ** 2).sum().item()
+                                        for ts in theta_start))
+                # 客户端更新方向冲突度 (pairwise cosine, 轻量)
+                deltas = [torch.cat([(lp - ts).flatten()
+                                     for lp, ts in zip(
+                                         local_models[ci].parameters(),
+                                         theta_start)])
+                          for ci in range(args.num_clients)]
+                cos = []
+                for i in range(args.num_clients):
+                    for j in range(i + 1, args.num_clients):
+                        cos.append(float(
+                            torch.dot(deltas[i], deltas[j])
+                            / (deltas[i].norm() * deltas[j].norm() + 1e-12)))
+                cos_sorted = sorted(cos)
+                print(f"  [Drift] client_update_norm mean={cup_mean:.4f} "
+                      f"median={cup_med:.4f} p95={cup_p95:.4f} "
+                      f"max={cup_max:.4f} | relative="
+                      f"{cup_mean / max(th_norm, 1e-12):.1%} "
+                      f"| global_update_norm={gup:.4f}")
+                print(f"  [Drift] client update pairwise cosine: "
+                      f"mean={sum(cos) / len(cos):.3f} "
+                      f"median={cos_sorted[len(cos) // 2]:.3f} "
+                      f"min={cos_sorted[0]:.3f} max={cos_sorted[-1]:.3f}")
         else:
             print("\n[Server FedAvg] 已跳过 (local_only)")
 
+        # ---- [ServerDelta 诊断] 服务端更新前 val (本地聚合后, 蒸馏/对抗前) ----
+        if args.federated_mode == 'fedavg':
+            _was_tr = global_model.training
+            global_model.eval()
+            with torch.no_grad():
+                _vb_res = evaluate_global(global_model, subgraphs,
+                                          args.task_mode, split='val',
+                                          device=device)
+            if _was_tr:
+                global_model.train()
+            _vb = (float(_vb_res.get('accuracy', float('nan')))
+                   if isinstance(_vb_res, dict) else float('nan'))
+        else:
+            _vb = float('nan')
+
         # -----------------------------------------------------------
         #  [8] 生成器更新 + [9] 全局蒸馏
-        #      (local_only 或 distill_weighting=none 时整体跳过)
+        #      (local_only / distill_weighting=none / round < server_start_round
+        #       时整体跳过; server_start_round 只推迟服务器阶段, 不影响
+        #       Stage2 初始化)
         # -----------------------------------------------------------
         L_G_report = None
         L_D_report = None
         gen_peak_mb = 0.0
-        if args.distill_weighting != 'none' and args.federated_mode == 'fedavg':
+        server_ran = False
+        if (args.distill_weighting != 'none' and args.federated_mode == 'fedavg'
+                and round_id >= args.server_start_round):
+            server_ran = True
             print("\n[Generator Update]")
 
             # 伪标签 (本轮 CKR 驱动)
@@ -2687,7 +3684,9 @@ def main():
             for ci in range(args.num_clients):
                 set_requires_grad(local_models[ci], False)
             set_requires_grad(global_model, False)
-            set_requires_grad(generator, True)
+            configure_generator_trainability(
+                generator, True,
+                freeze_skip_scale=args.diffusion_freeze_skip_scale)
             generator.train()
             for ci in range(args.num_clients):
                 local_models[ci].eval()
@@ -2703,6 +3702,14 @@ def main():
                 torch.cuda.reset_peak_memory_stats()
 
             sampling_steps = args.generator_sampling_steps or args.diffusion_steps
+            if (round_id == 0 and 0 < sampling_steps < args.diffusion_steps):
+                print(f"  ⚠ [sampling] generator_sampling_steps={sampling_steps} "
+                      f"< diffusion_steps={args.diffusion_steps}: 从 "
+                      f"t={sampling_steps - 1} 起步但 x_T 仍是纯噪声, "
+                      f"alpha_bar[{sampling_steps - 1}]="
+                      f"{generator.alpha_bars[sampling_steps - 1].item():.3f} ≠ 0, "
+                      f"存在时序错配。建议满步 (--generator_sampling_steps 0) "
+                      f"或实现正确 respacing。")
 
             def _make_fake_graph(fake_x):
                 if args.fake_graph_topology == 'isolated':
@@ -2712,6 +3719,10 @@ def main():
                     return Data(x=fake_x, edge_index=ei)
                 k = min(args.knn_k, fake_labels.shape[0] - 1)
                 return build_knn_graph(fake_x, k=k)
+
+            # 清空所有 generator 参数历史 grad (被冻结的 skip scale 不在
+            # gen_optimizer 参数组, optimizer.zero_grad 清不到它)
+            generator.zero_grad(set_to_none=True)
 
             for step in range(args.generator_steps):
                 gen_optimizer.zero_grad()
@@ -2724,10 +3735,16 @@ def main():
                     break
 
                 # 可微生成 (full / checkpointed / truncated)
-                fake_x = generator.differentiable_sample(
+                # radius 约束下取 raw 输出再投影: x = r_c·z/‖z‖, 堵住幅度作弊
+                raw_fake_x = generator.differentiable_sample(
                     labels=fake_labels, num_steps=sampling_steps,
                     backprop_mode=args.generator_backprop_mode,
-                    truncate_interval=args.generator_truncate_interval)
+                    truncate_interval=args.generator_truncate_interval,
+                    apply_output_bound=(not use_radius_proj))
+                fake_x = raw_fake_x
+                if use_radius_proj:
+                    fake_x = project_to_pretrain_radius(
+                        raw_fake_x, fake_labels, radius_bank)
                 if args.feature_stats_align:
                     fake_x = match_feature_stats(fake_x, g_feat_mu, g_feat_std)
                 fake_graph = _make_fake_graph(fake_x)
@@ -2755,6 +3772,13 @@ def main():
                        + args.lambda_feature_norm * L_norm)
                 if not is_warmup:
                     L_G = L_G - args.lambda_disagreement * L_dis
+                # L2-SP 参数锚: 限制生成器离预训练 prior (θ_pre) 太远
+                L_anchor = None
+                if (pretrain_ref is not None
+                        and args.lambda_diffusion_anchor > 0):
+                    L_anchor = diffusion_prior_anchor_loss(generator,
+                                                           pretrain_ref)
+                    L_G = L_G + args.lambda_diffusion_anchor * L_anchor
 
                 L_G.backward()
 
@@ -2776,11 +3800,44 @@ def main():
                     gen_peak_mb = max(gen_peak_mb,
                                       torch.cuda.max_memory_allocated() / 1024 ** 2)
 
+                raw_r = torch.linalg.vector_norm(raw_fake_x, ord=2,
+                                                 dim=1).median().item()
+                proj_r = torch.linalg.vector_norm(fake_x, ord=2,
+                                                  dim=1).median().item()
+                ratio_extra = ""
+                if use_radius_proj:
+                    _M = radius_bank.shape[1]
+                    _tgt = radius_bank[fake_labels,
+                                       torch.arange(fake_labels.shape[0],
+                                                    device=device) % _M]
+                    _tgt_med = _tgt.median().item()
+                    # cheating-pressure: raw 输出相对 target 的放大倾向
+                    ratio_extra = (f" raw/target={raw_r / max(_tgt_med, 1e-9):.3f}"
+                                   f" proj/target={proj_r / max(_tgt_med, 1e-9):.3f}")
+                extra = (f" anchor={L_anchor.item():.4f}"
+                         if L_anchor is not None else "")
                 print(f"  step {step}: L_sem={L_sem.item():.4f} "
                       f"L_dis={L_dis.item():.4f} "
                       f"L_div={L_div.item():.4f} L_norm={L_norm.item():.4f} "
                       f"L_G={L_G.item():.4f} |grad|={grad_norm:.4f} "
-                      f"fake_x μ={fake_x.mean().item():.4f} σ={fake_x.std().item():.4f}")
+                      f"fake_x μ={fake_x.mean().item():.4f} "
+                      f"σ={fake_x.std().item():.4f} "
+                      f"raw_r={raw_r:.4f} proj_r={proj_r:.4f}"
+                      f"{extra}")
+
+            if pretrain_ref is not None:
+                drift = compute_theta_drift(generator, pretrain_ref)
+                c_delta = None
+                if (getattr(generator, 'skip_mode', 'none') == 'timestep_scalar'
+                        and 'skip_log_scale.weight' in pretrain_ref):
+                    c_delta = float(
+                        (generator.skip_log_scale.weight
+                         - pretrain_ref['skip_log_scale.weight'])
+                        .abs().max().item())
+                print(f"  [Prior Drift] theta_drift={drift:.4f} "
+                      f"(‖θ−θ_pre‖/‖θ_pre‖)"
+                      + (f" | skip_delta={c_delta:.2e} (冻结校验)"
+                         if c_delta is not None else ""))
 
             if torch.cuda.is_available():
                 print(f"  [Memory] 生成器阶段峰值显存: {gen_peak_mb:.1f} MB")
@@ -2813,9 +3870,15 @@ def main():
             print("\n[Global Distillation]")
 
             # 用推理 sample 生成最终伪图
+            # 与生成器更新**同一参数化**: raw → radius 投影 → KNN (两边对抗同一分布)
             with torch.no_grad():
-                fake_x = generator.sample(
-                    labels=fake_labels, num_steps=sampling_steps, device=device)
+                raw_fake_x = generator.sample(
+                    labels=fake_labels, num_steps=sampling_steps, device=device,
+                    apply_output_bound=(not use_radius_proj))
+                fake_x = raw_fake_x
+                if use_radius_proj:
+                    fake_x = project_to_pretrain_radius(
+                        raw_fake_x, fake_labels, radius_bank)
                 if args.feature_stats_align:
                     fake_x = match_feature_stats(fake_x, g_feat_mu, g_feat_std)
                 fake_graph = _make_fake_graph(fake_x)
@@ -2828,7 +3891,9 @@ def main():
                     logits_before.append(global_model.forward(sg)[sg.val_idx])
             params_before = [p.clone() for p in global_model.parameters()]
 
-            set_requires_grad(generator, False)
+            configure_generator_trainability(
+                generator, False,
+                freeze_skip_scale=args.diffusion_freeze_skip_scale)
             for ci in range(args.num_clients):
                 set_requires_grad(local_models[ci], False)
             set_requires_grad(global_model, True)
@@ -2860,6 +3925,15 @@ def main():
                 global_optimizer.step()
                 L_D_report = L_D.item()
                 print(f"  step {step}: L_D={L_D.item():.4f} |grad|={gn:.4f}")
+
+            # ---- [ServerUpdateNorm 诊断] 蒸馏对 global 模型的参数位移 ----
+            s_up = math.sqrt(sum(
+                ((p - pb) ** 2).sum().item()
+                for p, pb in zip(global_model.parameters(), params_before)))
+            s_norm = math.sqrt(sum((pb ** 2).sum().item()
+                                   for pb in params_before))
+            print(f"  [ServerUpdateNorm] norm={s_up:.4f} "
+                  f"relative={s_up / max(s_norm, 1e-12):.4%}")
 
             # ---- 平台集成: 全局蒸馏结构化事件 (伪图统计 + 教师权重) ----
             fake_n = int(fake_x.shape[0])
@@ -2910,6 +3984,31 @@ def main():
                 with open(args.distillation_diagnostics_jsonl, 'a') as f:
                     f.write(json.dumps(record) + '\n')
 
+        else:
+            if (args.distill_weighting != 'none'
+                    and args.federated_mode == 'fedavg'):
+                print(f"\n[Server Skipped] round {round_id} < "
+                      f"server_start_round={args.server_start_round}: "
+                      f"生成器更新与全局蒸馏均不执行 (仅客户端训练 + FedAvg)")
+
+        # ---- [ServerDelta 诊断] 服务端蒸馏后 val ----
+        if args.federated_mode == 'fedavg':
+            _was_tr = global_model.training
+            global_model.eval()
+            with torch.no_grad():
+                _va_res = evaluate_global(global_model, subgraphs,
+                                          args.task_mode, split='val',
+                                          device=device)
+            if _was_tr:
+                global_model.train()
+            _va = (float(_va_res.get('accuracy', float('nan')))
+                   if isinstance(_va_res, dict) else float('nan'))
+        else:
+            _va = float('nan')
+        print(f"  [ServerDelta] val_before={_vb:.4f} val_after={_va:.4f} "
+              f"server_delta={_va - _vb:+.4f}"
+              + ("" if server_ran else "  [SKIPPED: server 未执行]"))
+
         # -----------------------------------------------------------
         #  [10-11] 校正全局模型 -> val_idx 模型选择 (最佳 checkpoint)
         # -----------------------------------------------------------
@@ -2924,8 +4023,13 @@ def main():
             global_model.eval()
             val_metrics = evaluate_global(global_model, subgraphs, args.task_mode,
                                           split='val', device=device)
-            test_metrics = evaluate_global(global_model, subgraphs, args.task_mode,
-                                           split='test', device=device)
+            if getattr(args, 'tuning_mode', False):
+                # test isolation: 调参模式完全不计算 test
+                test_metrics = {k: float('nan') for k in val_metrics}
+            else:
+                test_metrics = evaluate_global(global_model, subgraphs,
+                                               args.task_mode,
+                                               split='test', device=device)
 
             primary_val = val_metrics[selection_metric]
             primary_test = test_metrics[selection_metric]
@@ -2961,7 +4065,9 @@ def main():
                         normal_classes=args.normal_classes,
                         anomaly_classes=args.anomaly_classes,
                         selection_metric=selection_metric,
-                        generator_cfg=generator_cfg, is_best=True)
+                        generator_cfg=generator_cfg, is_best=True,
+                        pretrain_ref=pretrain_ref, radius_bank=radius_bank,
+                        local_optimizers=local_optimizers)
                     print(f"  [Checkpoint] 保存 best.pt (round {round_id}, "
                           f"{selection_metric}={best_val_primary:.4f})")
                     _emit_event(args, 'checkpoint_saved', round_id=round_id,
@@ -2984,7 +4090,9 @@ def main():
                     normal_classes=args.normal_classes,
                     anomaly_classes=args.anomaly_classes,
                     selection_metric=selection_metric,
-                    generator_cfg=generator_cfg, is_best=False)
+                    generator_cfg=generator_cfg, is_best=False,
+                    pretrain_ref=pretrain_ref, radius_bank=radius_bank,
+                    local_optimizers=local_optimizers)
                 print(f"  [Checkpoint] 保存 last.pt (round {round_id})")
                 _emit_event(args, 'checkpoint_saved', round_id=round_id,
                             stage='evaluation', checkpoint='last.pt',
@@ -3112,8 +4220,23 @@ def main():
             print("[Final Test] 无 checkpoint, 使用当前全局模型 (仅诊断)")
         global_model.eval()
 
-    final_test = collect_final_metrics(final_eval, subgraphs, args.task_mode,
-                                       split='test', evaluation_scope=eval_scope)
+    if getattr(args, 'tuning_mode', False):
+        # test isolation: 调参模式不计算最终 test (objective 只读 validation);
+        # 结构镜像 collect_final_metrics 的 multiclass 形状, 全部 NaN
+        _nan = {'accuracy': float('nan'), 'macro_f1': float('nan')}
+        final_test = {
+            'pooled': dict(_nan), 'client_macro': dict(_nan),
+            'client_weighted': dict(_nan), 'fedtad_official': dict(_nan),
+            'per_client': {}, 'num_test_samples': 0,
+            'evaluation_scope': eval_scope,
+            'aggregation_levels': ['pooled', 'client_macro',
+                                   'client_weighted', 'fedtad_official'],
+            'valid_clients': {'all': True},
+            'metric_comparability_group': 'tuning|test-not-evaluated'}
+        print("[Final Test] [tuning] test 不计算 (test isolation)")
+    else:
+        final_test = collect_final_metrics(final_eval, subgraphs, args.task_mode,
+                                           split='test', evaluation_scope=eval_scope)
     if args.task_mode == 'multiclass':
         print(f"  [Final test ({eval_scope})] pooled acc={final_test['pooled']['accuracy']:.2f} "
               f"macro_f1={final_test['pooled']['macro_f1']:.2f} | "

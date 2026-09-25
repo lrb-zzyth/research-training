@@ -82,21 +82,45 @@ class ConditionalDiffusionGenerator(nn.Module):
 
     def __init__(self, feat_dim, num_classes, hidden_dim=256,
                  num_steps=50, beta_start=1e-4, beta_end=0.02,
-                 output_bound='tanh'):
+                 output_bound='tanh', residual_skip=False,
+                 skip_mode='none', use_posterior_variance=True):
         super().__init__()
         self.feat_dim = feat_dim
         self.num_classes = num_classes
         self.num_steps = num_steps
         self.output_bound = output_bound
+        # reverse 步的噪声方差: True 用 posterior variance β̃_t (当前默认主行为),
+        # False 用历史 √β_t 路径 (仅消融, 由 --use_posterior_variance 控制)
+        self.use_posterior_variance = use_posterior_variance
+        # 直通残差模式 (denoiser 内部架构):
+        #   'none'            旧版 (无直通)
+        #   'fixed'           eps_pred = x_t + body(x_t,t,c)   [= 旧 residual_skip]
+        #   'timestep_scalar' eps_pred = c(t)·x_t + body, c(t)=exp(g_t) 每步一个
+        #                     可学习正 scalar, 初始化 1 (完全复现 fixed 初始行为),
+        #                     自动学 early-t 的放大系数, 修 identity skip 的结构性 bias
+        if skip_mode == 'none' and residual_skip:
+            skip_mode = 'fixed'   # 兼容旧参数
+        self.skip_mode = skip_mode
+        if skip_mode == 'timestep_scalar':
+            self.skip_log_scale = nn.Embedding(num_steps, 1)
+            nn.init.zeros_(self.skip_log_scale.weight)
 
         # Variance schedule (DDPM structure, used only for reverse step shape)
         betas = torch.linspace(beta_start, beta_end, num_steps)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
 
+        # DDPM posterior variance β̃_t = β_t·(1−ᾱ_{t−1})/(1−ᾱ_t)
+        # (β 很大时 √β_t 注入噪声过强, 用 β̃_t 修正; β̃_0 = 0 天然保证 t=0 无噪声)
+        alpha_bars_prev = torch.cat([torch.ones_like(alpha_bars[:1]),
+                                     alpha_bars[:-1]])
+        posterior_variance = (betas * (1.0 - alpha_bars_prev)
+                              / (1.0 - alpha_bars).clamp_min(1e-12))
+
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alpha_bars', alpha_bars)
+        self.register_buffer('posterior_variance', posterior_variance)
 
         # Sinusoidal-style time embedding
         self.time_embed = nn.Sequential(
@@ -135,7 +159,13 @@ class ConditionalDiffusionGenerator(nn.Module):
         t_emb = self.time_embed(t_float.unsqueeze(-1))          # [B, H]
         c_emb = self.class_embed(labels)                        # [B, H]
         h = torch.cat([x_t, t_emb, c_emb], dim=-1)              # [B, F+H+H]
-        return self.net(h)
+        out = self.net(h)
+        if self.skip_mode == 'fixed':
+            out = x_t + out
+        elif self.skip_mode == 'timestep_scalar':
+            c_t = torch.exp(self.skip_log_scale(t))             # [B, 1], 初始化 exp(0)=1
+            out = c_t * x_t + out
+        return out
 
     def denoise_loss(self, x0, labels, t=None, reduce='mean'):
         """
@@ -174,8 +204,13 @@ class ConditionalDiffusionGenerator(nn.Module):
         else:
             return x
 
-    def _reverse_step(self, x_t, t, labels, num_steps_total):
-        """单步反向变换 (可被 checkpoint 分组包裹)。"""
+    def _reverse_step(self, x_t, t, labels, num_steps_total,
+                      noise_generator=None):
+        """单步反向变换 (可被 checkpoint 分组包裹)。
+
+        noise_generator: 可选的 torch.Generator, 固定逐步噪声 (纵向诊断用,
+        每次采样前由调用方重置种子); None 时用全局 RNG (默认行为不变)。
+        """
         batch_size = x_t.shape[0]
         t_tensor = torch.full((batch_size,), t, device=x_t.device, dtype=torch.long)
         eps_pred = self.forward(x_t, t_tensor, labels)
@@ -184,16 +219,24 @@ class ConditionalDiffusionGenerator(nn.Module):
         alpha_bar_t = self.alpha_bars[t]
         beta_t = self.betas[t]
 
-        noise = torch.randn_like(x_t) if t > 0 else torch.zeros_like(x_t)
+        if t > 0:
+            noise = (torch.randn(x_t.shape, generator=noise_generator,
+                                 device=x_t.device, dtype=x_t.dtype)
+                     if noise_generator is not None else torch.randn_like(x_t))
+        else:
+            noise = torch.zeros_like(x_t)
         coef1 = 1.0 / torch.sqrt(alpha_t + 1e-8)
         coef2 = beta_t / (torch.sqrt(1.0 - alpha_bar_t) + 1e-8)
         mu = coef1 * (x_t - coef2 * eps_pred)
-        sigma = torch.sqrt(beta_t + 1e-8)
+        # posterior variance β̃_t (默认主行为) / 历史 √β_t 路径 (--no-use_posterior_variance)
+        variance = (self.posterior_variance[t]
+                    if self.use_posterior_variance else self.betas[t])
+        sigma = torch.sqrt(variance)
         return mu + sigma * noise
 
     def differentiable_sample(self, labels, num_steps=None, guidance_fn=None,
                               backprop_mode='full', truncate_interval=1,
-                              checkpoint_segments=1):
+                              checkpoint_segments=1, apply_output_bound=True):
         """
         可微反向生成 —— 训练用，保留计算图。
 
@@ -216,6 +259,8 @@ class ConditionalDiffusionGenerator(nn.Module):
             backprop_mode: 'full' | 'checkpointed' | 'truncated'
             truncate_interval: truncated 模式每隔 N 步 detach 一次
             checkpoint_segments: checkpointed 模式每 N 步分组重计算
+            apply_output_bound: False 时返回 raw 反向输出 (radius 流形约束等
+                                外部参数化需要, 绕过末段 tanh)
 
         Returns:
             [B, F] 生成的伪节点特征 (requires_grad=True)
@@ -279,37 +324,38 @@ class ConditionalDiffusionGenerator(nn.Module):
                     x_prev = guidance_fn(x_prev, t_tensor, labels)
                 x_t = x_prev
 
-        return self._apply_output_bound(x_t)
+        return self._apply_output_bound(x_t) if apply_output_bound else x_t
 
     @torch.no_grad()
-    def sample(self, labels, num_steps=None, device='cpu'):
+    def sample(self, labels, num_steps=None, device='cpu',
+               apply_output_bound=True, initial_noise=None,
+               noise_generator=None):
         """
         推理用反向生成 —— @torch.no_grad()，不保留计算图。
+        与 differentiable_sample 共用 _reverse_step 的同一套反向公式
+        (posterior variance 等修正两处自动一致, 无双实现漂移)。
+
+        initial_noise: 可选的固定初始噪声 [B, F]。None 时随机采样
+        (默认行为不变); 传固定值用于纵向诊断 (跨轮比较模型变化时,
+        排除 sampling noise 干扰)。
+        noise_generator: 可选的 torch.Generator, 固定逐步反向噪声。
+        注意: generator 状态随调用推进, 重复采样前需由调用方重置种子。
         """
         if num_steps is None:
             num_steps = self.num_steps
         num_steps = min(num_steps, self.num_steps)
 
         batch_size = labels.shape[0]
-        x_t = torch.randn(batch_size, self.feat_dim, device=device)
+        if initial_noise is None:
+            x_t = torch.randn(batch_size, self.feat_dim, device=device)
+        else:
+            x_t = initial_noise.clone()
 
         for t in reversed(range(num_steps)):
-            t_tensor = torch.full((batch_size,), t, device=device,
-                                  dtype=torch.long)
-            eps_pred = self.forward(x_t, t_tensor, labels)
+            x_t = self._reverse_step(x_t, t, labels, num_steps,
+                                     noise_generator=noise_generator)
 
-            alpha_t = self.alphas[t]
-            beta_t = self.betas[t]
-            alpha_bar_t = self.alpha_bars[t]
-
-            noise = torch.randn_like(x_t) if t > 0 else torch.zeros_like(x_t)
-            mu = (1.0 / torch.sqrt(alpha_t + 1e-8)) * (
-                x_t - (beta_t / (torch.sqrt(1.0 - alpha_bar_t) + 1e-8)) * eps_pred
-            )
-            sigma = torch.sqrt(beta_t + 1e-8)
-            x_t = mu + sigma * noise
-
-        return self._apply_output_bound(x_t)
+        return self._apply_output_bound(x_t) if apply_output_bound else x_t
 
 
 # 历史别名（仅反映阶段2「教师引导」命名），保留兼容
