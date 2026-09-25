@@ -42,30 +42,42 @@ class GCN(nn.Module):
 
 
 # =========================================================================
-#  教师引导的扩散式无数据生成器
+#  联邦预训练条件扩散生成器 + 教师引导对抗精调
+#  (Federated-Pretrained Conditional Diffusion Generator
+#   with Teacher-Guided Adversarial Refinement)
 #  alias: TeacherGuidedDiffusionGenerator
 #
-#  设计定位：
-#    不依赖标准 DDPM 的噪声预测预训练（L_simple）。
-#    生成器从纯高斯噪声 x_T ~ N(0, I) 出发，
-#    使用扩散式多步反向变换结构，
-#    由客户端教师模型的语义反馈和模型分歧进行无数据训练。
+#  两阶段训练 (见 train_fedtad.py)：
+#    阶段1 联邦条件 DDPM 预训练 (--federated_diffusion_pretrain, 默认开启)：
+#      各客户端本地对真实 x0 做前向加噪 + 噪声预测 (denoise_loss, 专利 S3.1/S3.2)，
+#      仅上传去噪网络参数，服务端按节点数加权聚合 —— 原始特征不出域 (专利权1)。
+#    阶段2 教师引导对抗精调：
+#      服务端以 L_sem / L_dis / L_div 训生成器（生成器最大化 L_dis 分歧），
+#      从纯高斯噪声 x_T ~ N(0, I) 出发经多步反向条件变换合成伪节点特征。
+#    伪特征 -> 余弦相似度 + KNN 构图 -> CKR 加权 KL 蒸馏 (build_knn_graph)。
 #    服务端不接触客户端原始图数据。
 # =========================================================================
 
 class ConditionalDiffusionGenerator(nn.Module):
     """
-    教师引导的扩散式无数据生成器 (Teacher-Guided Diffusion-Style Data-Free Generator)
+    条件扩散伪特征生成器：联邦预训练 + 教师引导对抗精调
+    (Federated-Pretrained Conditional Diffusion Generator
+     with Teacher-Guided Adversarial Refinement)
 
-    与标准 DDPM 的关键区别：
-    - 不使用真实数据 x0 做前向加噪 / 噪声预测预训练
-    - 生成器从纯高斯噪声出发，经多步反向条件变换合成伪节点特征
-    - 训练信号来自 S4 对抗蒸馏的语义损失、散度损失和多样性损失
-    - 服务端不访问客户端原始 data.x / data.edge_index
+    两阶段训练：
+    1) 联邦条件 DDPM 预训练 (federated_diffusion_pretrain, 默认开启)：
+       客户端本地对真实 x0 做前向加噪 + 噪声预测 (denoise_loss)，
+       仅上传去噪网络参数，服务端按节点数加权聚合；原始特征不出域 (专利权1 / S3.1)。
+    2) 教师引导对抗精调 (服务端每轮, L_sem / L_dis / L_div)：
+       生成器从纯高斯噪声 x_T ~ N(0, I) 出发，经多步反向条件变换合成伪节点特征；
+       最小化语义/多样性损失、最大化教师分歧损失（对抗）。
+       伪特征经余弦相似度 + KNN 构图后，用于 CKR 加权 KL 蒸馏。
+       服务端不访问客户端原始 data.x / data.edge_index。
 
     本类同时提供：
-      differentiable_sample() —— 训练用，保留计算图
-      sample()               —— 推理/验证用，torch.no_grad()
+      denoise_loss()           —— 阶段1：标准 DDPM 前向加噪 + 噪声预测 (S3.1/S3.2)
+      differentiable_sample()  —— 训练用，保留计算图
+      sample()                 —— 推理/验证用，torch.no_grad()
     """
 
     def __init__(self, feat_dim, num_classes, hidden_dim=256,
@@ -300,5 +312,5 @@ class ConditionalDiffusionGenerator(nn.Module):
         return self._apply_output_bound(x_t)
 
 
-# 别名：更准确地反映本生成器的定位
+# 历史别名（仅反映阶段2「教师引导」命名），保留兼容
 TeacherGuidedDiffusionGenerator = ConditionalDiffusionGenerator

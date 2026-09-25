@@ -97,18 +97,26 @@ with tempfile.TemporaryDirectory() as tmpA:
     rounds2 = sorted({r['round'] for r in r2})
     print(f"  phase1 rounds={rounds1}, phase2 rounds={rounds2}")
     assert len(rounds1) == 2 and len(rounds2) >= 1, "round continuity broken"
-    assert max(rounds1) + 1 == min(rounds2), "resume round must continue phase1"
+    # 恢复语义: 从 best.pt 的 round+1 继续 (ckpt 存 0-based 内部轮; tracker 记 1-based)。
+    # 注意不能断言 max(rounds1)+1 == min(rounds2) —— 若 phase1 最优轮不是最后一轮,
+    # 恢复会从最优轮之后继续 (语义正确, 但会重跑 phase1 已跑过的若干轮)。
+    assert min(rounds2) == ck['round'] + 2, \
+        f"resume must continue after checkpoint round {ck['round']}, " \
+        f"got min phase2 round {min(rounds2)}"
 
-    # EMA 连续性 (跨 checkpoint 边界): phase1 末轮 -> phase2 首轮
+    # EMA 连续性 (跨 checkpoint 边界): 恢复后首轮 vs 恢复前同轮次的末条记录
     #   ema(t) = 0.8*ema(t-1) + 0.2*(0.5*static_scaled + 0.5*dynamic_metric)
     # 若 tracker 未从 checkpoint 恢复 (重新初始化), 首轮 ema 会等于 candidate,
     # 该等式即失效 -> 这正是"恢复后 EMA 连续"的判定
     by_round1 = {}
     for rec in r1:
         by_round1.setdefault(rec['round'], []).append(rec)
-    t_prev = max(by_round1)
+    first2 = min(rounds2)
+    t_prev = first2 - 1          # 恢复前 tracker 已记录的最后一轮
+    assert t_prev in by_round1, f"phase1 history missing round {t_prev}"
     cells1 = {(rec['client_id'], rec['class_id']): rec for rec in by_round1[t_prev]}
-    cells2 = {(rec['client_id'], rec['class_id']): rec for rec in r2}
+    cells2 = {(rec['client_id'], rec['class_id']): rec
+              for rec in r2 if rec['round'] == first2}
     checked = 0
     for key, rec2 in cells2.items():
         rec1 = cells1.get(key)
@@ -121,7 +129,7 @@ with tempfile.TemporaryDirectory() as tmpA:
         checked += 1
     assert checked > 0, "no available cells to check EMA continuity"
     print(f"  EMA continuity across checkpoint resume verified over "
-          f"{checked} (client,class) cells (round {t_prev} -> {r2[0]['round']}) ✓")
+          f"{checked} (client,class) cells (round {t_prev} -> {first2}) ✓")
     print("SMOKE A PASSED ✓")
 
 

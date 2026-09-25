@@ -104,33 +104,53 @@ def construct_graph(node_logits, adj_logits, k=5):
 # =========================================================================
 
 def edge_perturbation(edge_index, num_nodes, drop_rate=0.2):
+    """
+    边扰动图增强 (用于子图-子图跨视图对比的第二视图)。
+
+    扰动语义: drop_rate = 总扰动比例, 其中 **删边 drop_rate/2 + 加边 drop_rate/2**。
+      例: drop_rate=0.2 → 删除 10% 的无向边, 并新增 10% 的无向边。
+
+    以**无向边**为扰动单位: 客户端图成对存储 (u,v)/(v,u),
+    先 canonicalize 为 (min,max) 去重 (自环忽略, 客户端图构建时已 rm_self_loops),
+    删/加都在无向边集合上进行, 最后展开回双向 —— 保证第二视图始终是合法的无向图。
+    """
     device = edge_index.device
     percent = drop_rate / 2.0
-    num_edges = edge_index.shape[1]
-    num_drop = int(num_edges * percent)
+
+    # 1) 折叠成无向边 (min,max) 去重
+    undirected = set()
+    for u, v in zip(edge_index[0].tolist(), edge_index[1].tolist()):
+        if u != v:
+            undirected.add((min(u, v), max(u, v)))
+    undirected = sorted(undirected)
+    E = len(undirected)
+
+    # 2) 以无向边为单位删/加
+    num_drop = int(E * percent)
     if num_drop <= 0:
         return edge_index.clone()
 
-    edge_list = list(zip(edge_index[0].tolist(), edge_index[1].tolist()))
-    existing = set(edge_list)
-
-    drop_idx = random.sample(range(num_edges), min(num_drop, num_edges))
-    remaining = [e for i, e in enumerate(edge_list) if i not in drop_idx]
+    drop_idx = set(random.sample(range(E), min(num_drop, E)))
+    remaining = [e for i, e in enumerate(undirected) if i not in drop_idx]
+    existing = set(undirected)
 
     added = []
     attempts = 0
     max_attempts = num_drop * 20
     while len(added) < num_drop and attempts < max_attempts:
         attempts += 1
-        i = random.randrange(num_nodes)
-        j = random.randrange(num_nodes)
-        if i != j and (i, j) not in existing:
-            added.append((i, j))
-            existing.add((i, j))
+        i, j = random.randrange(num_nodes), random.randrange(num_nodes)
+        if i != j:
+            e = (min(i, j), max(i, j))
+            if e not in existing:
+                added.append(e)
+                existing.add(e)
 
-    new_edges = remaining + added
-    new_edge_index = torch.tensor(new_edges, dtype=torch.long,
-                                  device=device).t().contiguous()
+    # 3) 展开回双向
+    final = remaining + added
+    src = [u for u, v in final] + [v for u, v in final]
+    dst = [v for u, v in final] + [u for u, v in final]
+    new_edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
     return new_edge_index
 
 

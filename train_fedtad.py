@@ -193,7 +193,9 @@ parser.add_argument('--contrastive_mode', type=str, default='subgraph_cross_view
                     choices=['subgraph_cross_view', 'none'],
                     help='subgraph_cross_view: 子图-子图跨视图对比(默认); '
                          'none: 不使用对比学习')
-parser.add_argument('--edge_perturb_ratio', type=float, default=0.2)
+parser.add_argument('--edge_perturb_ratio', type=float, default=0.2,
+                    help='边扰动总比例: 删除 ratio/2 的无向边 + 新增 ratio/2 的无向边 '
+                         '(第二视图增强, 以无向边为单位)')
 parser.add_argument('--rwr_restart_prob', type=float, default=0.5)
 parser.add_argument('--rwr_subgraph_size', type=int, default=5)
 parser.add_argument('--contrastive_batch_size', type=int, default=64)
