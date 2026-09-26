@@ -122,11 +122,16 @@ conda activate fedtad5060
 
 ## 14. 怎么安装依赖
 
-上一步 `conda env create` 已经按 `environment.yml` 装好全部依赖。若个别包失败：
+`environment.yml` / `requirements_frozen.txt` 已加入 PyTorch cu128 官方 wheel index
+与 PyG 对应 wheel 页面。PyTorch/PyG 的 CUDA 扩展不能只靠默认 PyPI 索引安装。
+若 `conda env create` 个别 pip 包失败，可在激活环境后重试：
 
 ```bash
 pip install -r requirements_frozen.txt
 ```
+
+另外，正式项目必须包含原仓库 vendored 的 `louvain/` 目录；不要用未知版本的
+第三方 Louvain 实现静默替换，否则客户端 partition 可能改变。
 
 ## 15. 怎么检查 GPU
 
@@ -140,7 +145,7 @@ nvidia-smi
 
 ```bash
 cd /root
-export STAGE1_PATH=/root/runs/formal_campaign_v2/Cora/clients5/stage1_generator.pt
+export STAGE1_PATH=/root/runs/formal_campaign_v3/Cora/clients5/stage1_generator.pt
 bash scripts/server_smoke_test.sh
 ```
 
@@ -156,7 +161,7 @@ tmux new -s fedtad
 
 ```bash
 # 先跑该 cell 的 Stage1 (20 联邦预训练轮, pretrain_diagnostic_only):
-mkdir -p runs/formal_campaign_v2/Cora/clients5/stage1
+mkdir -p runs/formal_campaign_v3/Cora/clients5/stage1
 python train_fedtad.py --root ./dataset --dataset Cora --num_clients 5 \
   --partition Louvain --num_rounds 1 --num_epochs 3 --hid_dim 64 --dropout 0.5 \
   --lr 1e-2 --weight_decay 5e-4 --task_mode multiclass \
@@ -164,15 +169,15 @@ python train_fedtad.py --root ./dataset --dataset Cora --num_clients 5 \
   --seed 2024 --reliability_holdout_ratio 0 \
   --diffusion_skip_mode timestep_scalar --diffusion_pretrain_rounds 20 \
   --pretrain_diagnostic_only \
-  --checkpoint_dir runs/formal_campaign_v2/Cora/clients5/stage1 \
-  > runs/formal_campaign_v2/Cora/clients5/stage1/stage1_training.log 2>&1
+  --checkpoint_dir runs/formal_campaign_v3/Cora/clients5/stage1 \
+  > runs/formal_campaign_v3/Cora/clients5/stage1/stage1_training.log 2>&1
 
 # 复制 checkpoint 到正式路径:
-cp runs/formal_campaign_v2/Cora/clients5/stage1/pretrained_generator.pt \
-   runs/formal_campaign_v2/Cora/clients5/stage1_generator.pt
+cp runs/formal_campaign_v3/Cora/clients5/stage1/pretrained_generator.pt \
+   runs/formal_campaign_v3/Cora/clients5/stage1_generator.pt
 
 # 检查 Stage1 health (raw radius 不得 nonfinite/数量级爆炸):
-tail -20 runs/formal_campaign_v2/Cora/clients5/stage1/stage1_training.log
+tail -20 runs/formal_campaign_v3/Cora/clients5/stage1/stage1_training.log
 
 # 启动正式 Optuna (v2 搜索空间, 12 healthy trials, 串行):
 bash scripts/run_formal_cell.sh Cora 5 12
@@ -192,7 +197,7 @@ tmux attach -t fedtad
 ## 21. 怎么看日志
 
 ```bash
-tail -f runs/formal_campaign_v2/Cora/clients5/campaign.log
+tail -f runs/formal_campaign_v3/Cora/clients5/campaign.log
 # 退出 tail: Ctrl+C
 ```
 
@@ -219,18 +224,18 @@ kill <PID>
 在**本地 Windows 终端**执行：
 
 ```bash
-scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v2/Cora/clients5/study_summary.csv .
-scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v2/Cora/clients5/best_params.json .
+scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v3/Cora/clients5/study_summary.csv .
+scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v3/Cora/clients5/best_params.json .
 ```
 
 ## 25. 怎么备份 study.db
 
 ```bash
 # 服务器上:
-cp runs/formal_campaign_v2/Cora/clients5/study.db \
-   runs/formal_campaign_v2/Cora/clients5/study_backup_$(date +%Y%m%d_%H%M%S).db
+cp runs/formal_campaign_v3/Cora/clients5/study.db \
+   runs/formal_campaign_v3/Cora/clients5/study_backup_$(date +%Y%m%d_%H%M%S).db
 # 或下载到本地:
-scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v2/Cora/clients5/study.db .
+scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v3/Cora/clients5/study.db .
 ```
 
 ---
@@ -241,3 +246,14 @@ scp -P 12345 root@120.46.12.34:/root/runs/formal_campaign_v2/Cora/clients5/study
 - 训练中断后直接重新执行 `bash scripts/run_formal_cell.sh Cora 5 12`，runner 会核对
   protocol hash / data identity / 搜索空间，一致则安全续跑（已完成 trial 不重跑）；
 - 若 protocol 不一致会直接报错退出（fail-fast），不要手动绕过。
+
+## 25. 调参完成后怎么跑正式 3-seed 决赛
+
+只有该 cell 已生成 `best_params.json` 后才运行：
+
+```bash
+bash scripts/run_formal_final.sh Cora 5
+```
+
+该脚本固定串行运行 2024/2025/2026 三个 seed。每个 seed 的 100 轮训练只看
+validation 选 best checkpoint；test 在训练结束、重新加载 val-best checkpoint 后只计算一次。

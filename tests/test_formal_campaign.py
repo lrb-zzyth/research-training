@@ -23,9 +23,15 @@ def _good_args(**kw):
                 radius_constraint=True, feature_stats_align=False,
                 diffusion_freeze_skip_scale=True,
                 federated_diffusion_pretrain=False,
-                diffusion_pretrained_checkpoint=os.path.join(
-                    fc.REPO, 'runs', 'accuracy_benchmark', 'DIAG_pubmed10_tsc20',
-                    'pretrained_generator_r20.pt'))
+                contrastive_mode='subgraph_cross_view', distill_loss_type='kl',
+                diffusion_skip_mode='timestep_scalar', diffusion_steps=20,
+                diffusion_beta_end=0.5, use_posterior_variance=True,
+                lambda_diffusion_anchor=1e-2, generator_sampling_steps=0,
+                generator_backprop_mode='checkpointed', checkpoint_segments=1,
+                fake_graph_topology='knn', tuning_mode=True,
+                final_test_only=False,
+                # guard 这里只验证“路径存在”；用测试文件自身避免依赖本机 runs/。
+                diffusion_pretrained_checkpoint=__file__)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -75,24 +81,38 @@ def test_objective_reads_val_only():
 
 
 def test_data_identity_fail_fast():
-    h1 = fc.compute_data_identity('PubMed', 10)
-    h2 = fc.compute_data_identity('PubMed', 10)
+    # 用第一个实际存在的 cached partition 作示例 (服务器部署可能只有部分数据集)
+    cand = [('Cora', 5), ('PubMed', 10)]
+    h1 = None
+    ds = tier = None
+    for _ds, _tier in cand:
+        if os.path.isdir(os.path.join(
+                fc.REPO, 'dataset', _ds,
+                'Client%d' % _tier, 'Louvain')):
+            ds, tier = _ds, _tier
+            h1 = fc.compute_data_identity(ds, tier)
+            break
+    if h1 is None:
+        print('data identity fail-fast: SKIP (无 cached partition)')
+        return
+    h2 = fc.compute_data_identity(ds, tier)
     assert h1 == h2 and len(h1) == 16, '同一划分 hash 必须稳定'
     saved = {'code_hash': 'x', 'data_identity_hash': 'DIFFERENT',
-             'search_space': fc.SEARCH_SPACE, 'dataset': 'PubMed',
-             'num_clients': 10, 'stage1_checkpoint_hash': 'y'}
+             'search_space': fc.SEARCH_SPACE, 'dataset': ds,
+             'num_clients': tier, 'stage1_checkpoint_hash': 'y'}
     try:
         fc.verify_protocol(saved, dict(saved, data_identity_hash=h1))
         raise AssertionError('data identity 不一致未 fail-fast')
     except ValueError:
         pass
-    print("data identity fail-fast: PASS")
+    print('data identity fail-fast: PASS (%s-c%d)' % (ds, tier))
 
 
 def test_protocol_resume_mismatch():
     saved = {'code_hash': 'oldcode', 'data_identity_hash': 'same',
              'search_space': fc.SEARCH_SPACE, 'dataset': 'PubMed',
-             'num_clients': 10, 'stage1_checkpoint_hash': 'same'}
+             'num_clients': 10, 'stage1_checkpoint_hash': 'same',
+             'formal_health_version': 'v2', 'formal_search_space_version': 'v2'}
     # code hash 变化
     try:
         fc.verify_protocol(saved, dict(saved, code_hash='newcode'))

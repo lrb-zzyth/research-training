@@ -5,7 +5,6 @@ import random
 import torch
 from torch import Tensor
 from torch_geometric.utils.convert import to_networkx
-from louvain.community import community_louvain
 from torch_geometric.data import Data
 
 def remove_self_loops(edge_index, edge_attr=None):
@@ -39,6 +38,15 @@ def idx_to_mask(index, size):
 
 def louvain_partition(graph, num_clients, delta=20, return_groups=False,
                       louvain_seed=2024):
+    # Lazy import: cached/frozen partitions do not need the vendored Louvain module.
+    # Rebuilding a partition still fails fast unless the original louvain/ tree exists.
+    try:
+        from louvain.community import community_louvain
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "Missing vendored louvain/ module; cannot rebuild the Louvain partition. "
+            "Copy louvain/ from the complete project; do not silently substitute a "
+            "different implementation because that can change client partitions.") from e
     num_nodes = graph.number_of_nodes()
 
     # 固定 Louvain 随机种子: 保证划分可复现 (python-louvain 默认不固定 RNG)

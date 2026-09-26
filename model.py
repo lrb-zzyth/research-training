@@ -205,7 +205,7 @@ class ConditionalDiffusionGenerator(nn.Module):
             return x
 
     def _reverse_step(self, x_t, t, labels, num_steps_total,
-                      noise_generator=None):
+                      noise_generator=None, noise_override=None):
         """单步反向变换 (可被 checkpoint 分组包裹)。
 
         noise_generator: 可选的 torch.Generator, 固定逐步噪声 (纵向诊断用,
@@ -220,9 +220,12 @@ class ConditionalDiffusionGenerator(nn.Module):
         beta_t = self.betas[t]
 
         if t > 0:
-            noise = (torch.randn(x_t.shape, generator=noise_generator,
-                                 device=x_t.device, dtype=x_t.dtype)
-                     if noise_generator is not None else torch.randn_like(x_t))
+            if noise_override is not None:
+                noise = noise_override
+            else:
+                noise = (torch.randn(x_t.shape, generator=noise_generator,
+                                     device=x_t.device, dtype=x_t.dtype)
+                         if noise_generator is not None else torch.randn_like(x_t))
         else:
             noise = torch.zeros_like(x_t)
         coef1 = 1.0 / torch.sqrt(alpha_t + 1e-8)
@@ -236,7 +239,8 @@ class ConditionalDiffusionGenerator(nn.Module):
 
     def differentiable_sample(self, labels, num_steps=None, guidance_fn=None,
                               backprop_mode='full', truncate_interval=1,
-                              checkpoint_segments=1, apply_output_bound=True):
+                              checkpoint_segments=1, apply_output_bound=True,
+                              initial_noise=None, noise_generator=None):
         """
         可微反向生成 —— 训练用，保留计算图。
 
@@ -261,6 +265,8 @@ class ConditionalDiffusionGenerator(nn.Module):
             checkpoint_segments: checkpointed 模式每 N 步分组重计算
             apply_output_bound: False 时返回 raw 反向输出 (radius 流形约束等
                                 外部参数化需要, 绕过末段 tanh)
+            initial_noise: 可选固定 x_T; 用于服务端专用 RNG/配对诊断。
+            noise_generator: 可选 torch.Generator, 控制每个 reverse step 的噪声。
 
         Returns:
             [B, F] 生成的伪节点特征 (requires_grad=True)
@@ -274,11 +280,32 @@ class ConditionalDiffusionGenerator(nn.Module):
         segments = max(1, int(checkpoint_segments))
 
         batch_size = labels.shape[0]
-        x_t = torch.randn(batch_size, self.feat_dim, device=labels.device)
+        if initial_noise is None:
+            x_t = (torch.randn(batch_size, self.feat_dim,
+                               generator=noise_generator, device=labels.device)
+                   if noise_generator is not None
+                   else torch.randn(batch_size, self.feat_dim, device=labels.device))
+        else:
+            x_t = initial_noise.clone()
+
+        # Pre-materialize every reverse-step noise tensor outside checkpointed
+        # regions.  This makes forward and backward recomputation use identical
+        # stochastic inputs.  It also makes full/checkpointed modes consume the
+        # same RNG stream under the same seed, whether a dedicated Generator is
+        # supplied or the global torch RNG is used.
+        reverse_noises = [None] * num_steps
+        for _t in range(1, num_steps):
+            reverse_noises[_t] = (
+                torch.randn(x_t.shape, generator=noise_generator,
+                            device=x_t.device, dtype=x_t.dtype)
+                if noise_generator is not None
+                else torch.randn_like(x_t))
 
         if backprop_mode == 'truncated':
             for t in reversed(range(num_steps)):
-                x_prev = self._reverse_step(x_t, t, labels, num_steps)
+                x_prev = self._reverse_step(
+                    x_t, t, labels, num_steps,
+                    noise_override=reverse_noises[t])
                 if guidance_fn is not None:
                     t_tensor = torch.full((batch_size,), t, device=labels.device,
                                           dtype=torch.long)
@@ -295,29 +322,40 @@ class ConditionalDiffusionGenerator(nn.Module):
             while t_start >= 0:
                 t_end = max(0, t_start - segments + 1)
                 if segments <= 1:
-                    # 逐步重计算
-                    x_prev = cp.checkpoint(self._reverse_step, x_t,
-                                           torch.tensor(t_start, device=labels.device),
-                                           labels, num_steps, use_reentrant=False)
+                    # Capture Python timestep in the closure; do not route control
+                    # flow through a CUDA scalar tensor during recomputation.
+                    _t = t_start
+                    def _one_step(x, t_fixed=_t):
+                        return self._reverse_step(
+                            x, t_fixed, labels, num_steps,
+                            noise_override=reverse_noises[t_fixed])
+                    x_prev = cp.checkpoint(
+                        _one_step, x_t, use_reentrant=False,
+                        preserve_rng_state=False)
                     if guidance_fn is not None:
-                        t_tensor = torch.full((batch_size,), t_start,
+                        t_tensor = torch.full((batch_size,), _t,
                                               device=labels.device, dtype=torch.long)
                         x_prev = guidance_fn(x_prev, t_tensor, labels)
                     x_t = x_prev
                 else:
-                    # 分段重计算: 一组 steps 作为一个 checkpoint 单元
-                    def _chunk(x, t_hi):
-                        for t in range(t_hi, t_end - 1, -1):
-                            x = self._reverse_step(x, t, labels, num_steps)
+                    # Group a contiguous reverse-step segment into one checkpoint.
+                    _hi, _lo = t_start, t_end
+                    def _chunk(x, t_hi=_hi, t_lo=_lo):
+                        for t in range(t_hi, t_lo - 1, -1):
+                            x = self._reverse_step(
+                                x, t, labels, num_steps,
+                                noise_override=reverse_noises[t])
                         return x
-                    x_prev = cp.checkpoint(_chunk, x_t,
-                                           torch.tensor(t_start, device=labels.device),
-                                           use_reentrant=False)
+                    x_prev = cp.checkpoint(
+                        _chunk, x_t, use_reentrant=False,
+                        preserve_rng_state=False)
                     x_t = x_prev
                 t_start -= segments
         else:  # full
             for t in reversed(range(num_steps)):
-                x_prev = self._reverse_step(x_t, t, labels, num_steps)
+                x_prev = self._reverse_step(
+                    x_t, t, labels, num_steps,
+                    noise_override=reverse_noises[t])
                 if guidance_fn is not None:
                     t_tensor = torch.full((batch_size,), t, device=labels.device,
                                           dtype=torch.long)

@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.utils import to_dense_adj, add_self_loops, dense_to_sparse
 from torch_geometric.data import Data
+from util.kl_utils import categorical_kl_from_logits
 
 
 # =========================================================================
@@ -23,10 +24,10 @@ def student_loss(s_logit, t_logit, return_t_logits=False, method="kl"):
         loss_fn = F.l1_loss
         loss = loss_fn(s_logit, t_logit.detach())
     elif method == "kl":
-        loss_fn = F.kl_div
-        s_logit = F.log_softmax(s_logit, dim=1)
-        t_logit = F.softmax(t_logit, dim=1)
-        loss = loss_fn(s_logit, t_logit.detach(), reduction="batchmean")
+        # FedTAD Eq.(10): KL(student/global || teacher/local).  Use the
+        # explicit helper so PyTorch kl_div input/target ordering cannot flip it.
+        loss = categorical_kl_from_logits(
+            s_logit, t_logit.detach(), temperature=1.0, reduction="batchmean")
     else:
         raise ValueError(method)
     if return_t_logits:
@@ -187,22 +188,25 @@ def _build_adj_list(edge_index, num_nodes):
 def rwr_subgraph_sampling(edge_index, num_nodes, anchor_nodes,
                           subgraph_size, restart_prob=0.5, max_length=200,
                           seed=None):
-    """
-    带重启的随机游走 (RWR) 局部子图采样。
+    """带重启随机游走采样 anchor-centered **local** subgraphs.
 
-    对每个锚点节点运行 RWR，收集最多 subgraph_size 个上下文节点。
-    返回的子图列表中，锚点的位置由 center_indices[i] 给出。
+    The historical fallback filled a short RWR sample with arbitrary nodes from
+    the whole client graph.  On fragmented Louvain clients that mixed unrelated
+    connected components into one pooled representation, contradicting patent
+    S2.2's anchor-centered local-subgraph semantics.
 
-    seed 非 None 时使用独立的 random.Random(seed) 实例,
-    相同 seed + 相同图/参数 => 相同采样结构 (用于 RWR 缓存 key 的确定性)。
+    New behavior:
+      1. RWR collects nodes in visit order.
+      2. If RWR hits ``max_length`` before the requested size, a local BFS expands
+         only inside the anchor's connected component.
+      3. If that connected component itself is smaller than the requested size,
+         return the smaller valid local subgraph; never inject disconnected nodes.
 
-    Returns:
-        subgraph_lists: list[list[int]] — 每个子图的全局节点 ID
-        center_indices: list[int] — 每个子图的锚点 local index
+    ``subgraph_size`` remains the number of context nodes; the anchor makes the
+    requested total size ``subgraph_size + 1``.
     """
     adj_list = _build_adj_list(edge_index, num_nodes)
     total_size = subgraph_size + 1
-
     rng = random.Random(seed) if seed is not None else random
 
     if torch.is_tensor(anchor_nodes):
@@ -213,6 +217,7 @@ def rwr_subgraph_sampling(edge_index, num_nodes, anchor_nodes,
 
     for anchor in anchor_nodes:
         visited = {anchor}
+        visit_order = [anchor]
         current = anchor
 
         for _ in range(max_length):
@@ -224,22 +229,36 @@ def rwr_subgraph_sampling(edge_index, num_nodes, anchor_nodes,
                 current = rng.choice(adj_list[current])
             if current not in visited:
                 visited.add(current)
+                visit_order.append(current)
 
-        subgraph = list(visited)
-        if len(subgraph) < total_size:
-            candidates = [n for n in range(num_nodes) if n not in visited]
-            if candidates:
-                needed = total_size - len(subgraph)
-                subgraph.extend(rng.sample(candidates,
-                                           min(needed, len(candidates))))
+        # Local fallback: expand through the anchor component only.  Shuffle each
+        # neighbor list with the same private RNG so seed determinism is retained
+        # without importing nodes from another connected component.
+        if len(visited) < total_size:
+            queue = [anchor]
+            expanded = set()
+            qpos = 0
+            while qpos < len(queue) and len(visited) < total_size:
+                u = queue[qpos]
+                qpos += 1
+                if u in expanded:
+                    continue
+                expanded.add(u)
+                nbrs = list(adj_list[u])
+                rng.shuffle(nbrs)
+                for v in nbrs:
+                    if v not in expanded:
+                        queue.append(v)
+                    if v not in visited:
+                        visited.add(v)
+                        visit_order.append(v)
+                        if len(visited) >= total_size:
+                            break
 
-        # Dedup, trim
-        subgraph = list(dict.fromkeys(subgraph))
-        subgraph = subgraph[:total_size]
-        if anchor not in subgraph:
-            subgraph[-1] = anchor  # fallback: ensure anchor is present
-        center_idx = subgraph.index(anchor)
-
+        subgraph = visit_order[:total_size]
+        # anchor is deliberately first; variable-size subgraphs are supported by
+        # the batched mean-readout path in train_fedtad.py.
+        center_idx = 0
         subgraph_lists.append(subgraph)
         center_indices.append(center_idx)
 

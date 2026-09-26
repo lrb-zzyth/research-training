@@ -30,7 +30,7 @@ import optuna
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 PY = sys.executable   # 服务器可移植: 用当前解释器 (本机/服务器 conda 路径自动适配)
-FORMAL_VERSION = 'v2'   # 正式战役版本: v2 = λsem 无 0.001 + formal_health v2
+FORMAL_VERSION = 'v3'   # v3 = corrected KL(global||local) + local-only RWR fallback + stable projection
 OUT = os.path.join(REPO, 'runs', f'formal_campaign_{FORMAL_VERSION}')
 
 DATASETS = ['Cora', 'CiteSeer', 'PubMed', 'CS', 'Physics']
@@ -59,6 +59,16 @@ FIXED_FLAGS = [
     '--contrastive_mode', 'subgraph_cross_view',
     '--local_optimizer_lifecycle', 'reset_each_round',
     '--diffusion_skip_mode', 'timestep_scalar',
+    '--diffusion_steps', '20',
+    '--diffusion_beta_start', '1e-4',
+    '--diffusion_beta_end', '0.5',
+    '--use_posterior_variance',
+    '--distill_loss_type', 'kl',
+    '--lambda_diffusion_anchor', '0.01',
+    '--generator_sampling_steps', '0',
+    '--generator_backprop_mode', 'checkpointed',
+    '--checkpoint_segments', '1',
+    '--fake_graph_topology', 'knn',
     '--diffusion_freeze_skip_scale',
     '--no-federated_diffusion_pretrain',
     '--num_rounds', '100',
@@ -72,10 +82,20 @@ FIXED_FLAGS = [
 
 
 def code_hash():
-    """核心代码文件内容 hash (工作区有未提交改动时 git HEAD 不代表实际代码)。"""
+    """正式战役完整代码 hash：训练数学 + 数据/CKR + runner/health/protocol。"""
     h = hashlib.md5()
-    for f in ['train_fedtad.py', 'model.py', 'util/task_util.py',
-              'util/checkpoint.py']:
+    for f in [
+            'train_fedtad.py', 'model.py',
+            'util/task_util.py', 'util/checkpoint.py',
+            'util/kl_utils.py', 'util/projection_utils.py',
+            'util/base_util.py', 'util/base_data_util.py', 'util/fgl_dataset.py',
+            'util/data_split.py', 'util/dynamic_ckr.py', 'util/rwr_cache.py',
+            'util/split_artifact.py',
+            'experiments/accuracy_benchmark/formal_campaign.py',
+            'experiments/accuracy_benchmark/formal_final_eval.py',
+            'scripts/run_formal_cell.sh', 'scripts/run_formal_final.sh',
+            'scripts/generate_stage1_all.sh', 'scripts/generate_stage1_cell.sh',
+            'scripts/launch_all_cells.sh']:
         with open(os.path.join(REPO, f), 'rb') as fh:
             h.update(fh.read())
     return h.hexdigest()[:12]
@@ -218,6 +238,10 @@ def build_protocol(ds, tier, target_healthy, max_attempts):
         'search_space': SEARCH_SPACE,
         'formal_search_space_version': 'v2',
         'formal_health_version': 'v2',
+        'training_math_version': 'v3-kl-global-local-rwr-local-stable-radius',
+        'kl_direction': 'KL(global||local) per FedTAD Eq.(10) / patent S4.2',
+        'rwr_fallback': 'anchor-connected-component-only',
+        'radius_projection': 'stable scale-invariant normalization',
         'lambda_diffusion_anchor': 1e-2,
         'sampler': 'TPESampler(seed=2024)',
         'pruner': 'none (无正式 pruning policy)',
@@ -233,8 +257,8 @@ def build_protocol(ds, tier, target_healthy, max_attempts):
 
 def verify_protocol(saved, current):
     """resume 时协议一致性 fail-fast。返回 None 或抛 ValueError。"""
-    for k in ('code_hash', 'data_identity_hash', 'search_space', 'dataset',
-              'num_clients', 'stage1_checkpoint_hash'):
+    ignored = {'target_healthy', 'max_attempts'}  # 仅预算，可安全增加
+    for k in sorted((set(saved) | set(current)) - ignored):
         if saved.get(k) != current.get(k):
             raise ValueError(
                 f"[Formal] protocol 不一致 ({k}): study 记录 "
@@ -249,24 +273,27 @@ def objective_value_from_metrics(path):
 
 
 def wait_gpu_memory(min_free_mb=6000, poll_sec=30):
-    """显存看门狗: 空闲显存不足时等待, 防并发 OOM 崩溃。无 GPU 时直接返回。"""
+    """
+    显存看门狗: 空闲显存不足时等待, 防并发 OOM 崩溃。无 GPU 时直接返回。
+
+    用 pynvml 直读 (纯 C 调用)。**严禁在 Optuna 并发 worker 线程里 fork**
+    (subprocess.run 会在多线程进程里死锁 —— 2026-09-26 服务器实战教训)。
+    """
     import time as _time
-    while True:
-        try:
-            r = subprocess.run(
-                ['nvidia-smi',
-                 '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=15)
-            if r.returncode != 0:
-                return   # 无 nvidia-smi (CPU 环境), 不拦截
-            free = max(int(x) for x in r.stdout.split())
+    try:
+        import pynvml as _nvml
+        _nvml.nvmlInit()
+        _handle = _nvml.nvmlDeviceGetHandleByIndex(0)
+        while True:
+            info = _nvml.nvmlDeviceGetMemoryInfo(_handle)
+            free = info.free // (1024 * 1024)
             if free >= min_free_mb:
                 return
             print(f"  [GPU Gate] 空闲显存 {free}MB < {min_free_mb}MB, "
                   f"等待 {poll_sec}s ...", flush=True)
             _time.sleep(poll_sec)
-        except Exception:
-            return
+    except Exception:
+        return   # 无 GPU/pynvml (CPU 环境), 不拦截
 
 
 def run_one_trial(ds, tier, seed, outdir, params, stage1, expect_data_hash,
@@ -288,8 +315,12 @@ def run_one_trial(ds, tier, seed, outdir, params, stage1, expect_data_hash,
     t0 = time.time()
     with open(os.path.join(outdir, 'stdout.log'), 'w') as fo, \
          open(os.path.join(outdir, 'stderr.log'), 'w') as fe:
-        subprocess.run(cmd, cwd=REPO, stdout=fo, stderr=fe, check=False)
+        proc = subprocess.run(cmd, cwd=REPO, stdout=fo, stderr=fe, check=False)
     wall = time.time() - t0
+    if proc.returncode != 0:
+        return None, wall, False, {'failure_round': None,
+                                  'failure_type': f'PROCESS_EXIT_{proc.returncode}',
+                                  'nonfinite_detected': False}
     fp = os.path.join(outdir, 'final_metrics.json')
     if not os.path.exists(fp):
         return None, wall, False, {'failure_round': None,
@@ -320,17 +351,16 @@ def main():
                          '(预算 = 健康 trial 数, 非 attempt 数)')
     ap.add_argument('--max_attempts', type=int, default=15,
                     help='每 cell attempt 上限 (防数值不稳定病态搜索无限跑)')
-    ap.add_argument('--n_jobs', type=int, default=2,
-                    help='并发 trial 数 (服务器大显存/大内存下放开; 本地 7GB 机器'
-                         '必须保持 1)。RNG v2 协议保证 trial 独立可复现; '
-                         '首个 trial 恒串行以生成 CKR 缓存避免文件竞态; '
-                         '每 trial 前有显存看门狗')
+    ap.add_argument('--n_jobs', type=int, default=1,
+                    help='正式协议固定串行 n_jobs=1（单 GPU 禁止并发 trial）')
     ap.add_argument('--gpu_mem_gate_mb', type=int, default=6000,
                     help='显存看门狗: 空闲显存低于该值(默认 6GB)时 trial 等待'
                          '而不启动, 防止 OOM 崩溃')
     ap.add_argument('--cells', default=None,
                     help='逗号分隔 "ds:tier"; 默认全部 15 cell')
     args = ap.parse_args()
+    if args.n_jobs != 1:
+        raise ValueError('正式战役协议固定 --n_jobs 1；单 GPU 不允许并发 trial。')
     cells = ([tuple(c.split(':')) for c in args.cells.split(',')]
              if args.cells else
              [(ds, t) for ds in DATASETS for t in TIERS])
@@ -400,9 +430,7 @@ def main():
                 print(f"[{ds} c{tier}] 达到 attempt 上限 {args.max_attempts} "
                       f"(healthy={_healthy()}) —— STOP 报告", flush=True)
                 break
-            # 首个 trial 恒串行: 生成 ./ckr 缓存, 避免并发写同一缓存文件竞态;
-            # 之后按 --n_jobs 并发 (RNG v2 协议保证 trial 独立可复现,
-            # 每个 trial 启动前过显存看门狗)
+            # 正式协议全程串行 (n_jobs=1)。保留 batch 结构仅用于安全 resume。
             has_history = any(t.state.name in ('COMPLETE', 'FAIL')
                               for t in study.trials)
             n_batch = 1 if not has_history else min(args.n_jobs, allowed,

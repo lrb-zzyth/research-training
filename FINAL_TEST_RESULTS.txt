@@ -1,0 +1,34 @@
+FedTAD final v3 local audit test summary
+Date: 2026-09-26
+Formal code hash: f38f7fe74ab5
+
+Executed in audit runtime:
+
+1) python -m compileall -q .
+   PASS
+
+2) bash -n scripts/*.sh
+   PASS
+
+3) python tests/test_final_v3_math.py
+   PASS (10/10)
+   - DDPM checkpointed vs full exact output/gradient
+   - edge perturbation undirected pairing
+   - formal campaign v3 identity
+   - InfoNCE denominator includes positive
+   - KL(global||local) explicit direction
+   - RWR local fallback fills reachable nodes only
+   - RWR never injects another connected component
+   - huge-finite raw radius projection remains finite
+   - direct generator/student KL paths match reference
+   - checkpoint_segments/formal wiring regression
+
+4) formal_campaign import/version/hash + health finite/inf synthetic checks
+   PASS
+
+Not executable in this audit runtime:
+- real torch_geometric end-to-end training
+- CUDA/RTX 4090 training smoke
+Reason: audit runtime lacks torch_geometric/CUDA.
+Mandatory on the rented server before formal training:
+    bash scripts/server_smoke_test.sh

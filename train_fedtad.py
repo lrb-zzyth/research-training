@@ -69,8 +69,12 @@ from util.checkpoint import (
     find_final_checkpoint,
 )
 from util.rwr_cache import RWRSubgraphCache
+from util.kl_utils import categorical_kl_from_logits
+from util.projection_utils import (
+    project_to_pretrain_radius as _stable_project_to_pretrain_radius,
+    diagnostic_l2_norm,
+)
 from model import GCN, ConditionalDiffusionGenerator
-from pretrain_diffusion import load_proxy_pretrained_generator
 
 warnings.filterwarnings('ignore')
 
@@ -347,6 +351,9 @@ parser.add_argument('--server_start_round', type=int, default=0,
 parser.add_argument('--tuning_mode', action='store_true',
                     help='[正式调参] test isolation: 调参模式下完全不计算/打印 test, '
                          '只按 validation 选轮; objective/pruner 无法读取 test')
+parser.add_argument('--final_test_only', action='store_true',
+                    help='[正式决赛] 每轮只评估 validation，训练结束加载 val-best '
+                         'checkpoint 后只计算一次 test；与 --tuning_mode 互斥。')
 parser.add_argument('--formal_campaign_guard', action='store_true',
                     help='[正式战役] 启动时校验完整正式协议 (见 validate_formal_campaign), '
                          '违反即 ValueError, 不自动修参数')
@@ -526,7 +533,8 @@ parser.add_argument('--f1_threshold', type=float, default=0.1,
 parser.add_argument('--auc_threshold', type=float, default=1.0,
                     help='第二终止(低资源): 客户端AUC连续N轮增幅小于该值')
 
-args = parser.parse_args()
+args = (parser.parse_args() if __name__ == '__main__'
+        else parser.parse_args([]))
 
 # ---- task_mode 自适应的默认值 (2026-09-21) ----
 # 这两个开关在 multiclass 口径下经 5 种子配对实测为负贡献/破坏可对照性,
@@ -1135,6 +1143,17 @@ def reseed_client_rng(args, round_id, ci):
     random.seed(local_seed)
 
 
+def make_server_rng(device, base_seed, round_id, stream_id):
+    """Stage2 专用 RNG，与客户端全局 RNG 完全解耦。
+
+    每个 (round, stream) 独立确定性播种。这样 generator_steps 等服务器路径
+    的 RNG 消耗不会改变下一轮客户端随机流，也不会改变 final-sampling stream。
+    """
+    seed = (int(base_seed) * 1_000_003 + int(round_id) * 10_007
+            + int(stream_id) * 97) % (2**63 - 1)
+    return torch.Generator(device=device).manual_seed(seed)
+
+
 def _model_param_hash(model):
     h = hashlib.md5()
     for p in model.parameters():
@@ -1161,6 +1180,29 @@ def _rng_fingerprint():
 def set_requires_grad(module, enabled):
     for p in module.parameters():
         p.requires_grad_(enabled)
+
+
+def formal_finite_guard(args, round_id, stage, tensors=None, modules=None,
+                        check_grads=False):
+    """正式战役 fail-fast 数值守门。
+
+    health checker 不能只依赖 stdout 正则；正式协议下在训练进程内部直接检查
+    raw/projected feature、loss、参数以及 backward 后梯度，发现 NaN/Inf 立即失败。
+    """
+    if not getattr(args, 'formal_campaign_guard', False):
+        return
+    for name, t in (tensors or {}).items():
+        if t is not None and not bool(torch.isfinite(t).all()):
+            raise FloatingPointError(
+                f"[FORMAL-NONFINITE] round={round_id} stage={stage} tensor={name}")
+    for name, module in (modules or {}).items():
+        for pn, p in module.named_parameters():
+            target = p.grad if check_grads else p.data
+            if target is not None and not bool(torch.isfinite(target).all()):
+                kind = 'grad' if check_grads else 'param'
+                raise FloatingPointError(
+                    f"[FORMAL-NONFINITE] round={round_id} stage={stage} "
+                    f"{kind}={name}.{pn}")
 
 
 def configure_generator_trainability(generator, trainable,
@@ -1225,6 +1267,25 @@ def validate_formal_campaign(args):
          bool(getattr(args, 'diffusion_freeze_skip_scale', False)), True),
         ('federated_diffusion_pretrain',
          bool(getattr(args, 'federated_diffusion_pretrain', False)), False),
+        ('contrastive_mode', getattr(args, 'contrastive_mode', None),
+         'subgraph_cross_view'),
+        ('distill_loss_type', getattr(args, 'distill_loss_type', None), 'kl'),
+        ('diffusion_skip_mode', getattr(args, 'diffusion_skip_mode', None),
+         'timestep_scalar'),
+        ('diffusion_steps', int(getattr(args, 'diffusion_steps', -1)), 20),
+        ('diffusion_beta_end', float(getattr(args, 'diffusion_beta_end', -1)), 0.5),
+        ('use_posterior_variance',
+         bool(getattr(args, 'use_posterior_variance', False)), True),
+        ('lambda_diffusion_anchor',
+         float(getattr(args, 'lambda_diffusion_anchor', -1)), 1e-2),
+        ('generator_sampling_steps',
+         int(getattr(args, 'generator_sampling_steps', -1)), 0),
+        ('generator_backprop_mode',
+         getattr(args, 'generator_backprop_mode', None), 'checkpointed'),
+        ('checkpoint_segments', int(getattr(args, 'checkpoint_segments', -1)), 1),
+        ('fake_graph_topology', getattr(args, 'fake_graph_topology', None), 'knn'),
+        ('test_isolation', bool(getattr(args, 'tuning_mode', False)
+                                or getattr(args, 'final_test_only', False)), True),
     ]
     bad = [n for n, got, exp in checks if got != exp]
     ck = getattr(args, 'diffusion_pretrained_checkpoint', '')
@@ -1238,6 +1299,11 @@ def validate_formal_campaign(args):
 
 def validate_run_args(args):
     """互斥/非法 CLI 组合 fail-fast (Bug 3/4/9)。不静默猜测用户意图。"""
+    if (getattr(args, 'tuning_mode', False)
+            and getattr(args, 'final_test_only', False)):
+        raise ValueError(
+            "--tuning_mode 与 --final_test_only 互斥: 调参期 test 必须完全隔离；"
+            "正式决赛才允许训练结束后计算一次 test。")
     if (getattr(args, 'resume_checkpoint', '')
             and getattr(args, 'diffusion_pretrained_checkpoint', '')):
         raise ValueError(
@@ -1396,7 +1462,7 @@ def build_knn_graph(fake_x, k):
 
 
 def sample_fake_labels(num_nodes, num_classes, strategy='balanced',
-                       ckr_weights=None, device='cpu'):
+                       ckr_weights=None, device='cpu', generator=None):
     if strategy == 'balanced':
         per_class = [num_nodes // num_classes] * num_classes
         for i in range(num_nodes % num_classes):
@@ -1404,7 +1470,8 @@ def sample_fake_labels(num_nodes, num_classes, strategy='balanced',
     elif ckr_weights is not None:
         probs = torch.tensor(ckr_weights, device=device).float()
         probs = probs / (probs.sum() + 1e-8)
-        labels = torch.multinomial(probs, num_nodes, replacement=True)
+        labels = torch.multinomial(probs, num_nodes, replacement=True,
+                                   generator=generator)
         per_class = [int((labels == c).sum()) for c in range(num_classes)]
         return labels, {c: per_class[c] for c in range(num_classes)}
     else:
@@ -1552,11 +1619,14 @@ def apply_label_mapping_to_data(data, normal_classes, anomaly_classes):
 #  S1: CKR 计算
 # =====================================================================
 
-def compute_ckr(subgraphs, num_classes, args, device):
-    # 缓存 key 必须包含 seed: 重划分后 train 集随 seed 变化, 跨 seed 复用旧 CKR 会引入泄漏
+def compute_ckr(subgraphs, num_classes, args, device, data_identity=None):
+    # CKR 完全由当前子图/标签/训练 mask 决定。仅用 dataset/seed 命名不足以防止
+    # “同名缓存但 data*.pt 或 split 已变化”的静默复用；正式路径绑定 data identity。
     cache_suffix = '_resplit' if getattr(args, 'resplit_after_label_mapping', False) else ''
+    identity_suffix = (f"_d{str(data_identity)[:12]}"
+                       if data_identity else '')
     ckr_path = (f"./ckr/{args.dataset}_{args.partition}_{args.num_clients}_"
-                f"{args.task_mode}{cache_suffix}_s{args.seed}.pt")
+                f"{args.task_mode}{cache_suffix}_s{args.seed}{identity_suffix}.pt")
     if os.path.exists(ckr_path):
         ckr = torch.load(ckr_path, map_location='cpu').to(device)
         print(f"  [CKR] 加载缓存: {ckr_path}")
@@ -1980,20 +2050,14 @@ def build_pretrain_radius_bank(generator, num_classes, device, bank_size=64,
 
 
 def project_to_pretrain_radius(raw_x, labels, radius_bank, eps=1e-12):
+    """Numerically stable hard manifold projection.
+
+    Algebraically identical to x = r_c * z / ||z||, but implemented through
+    O(1)-scaled rows so a large-yet-finite float32 raw trajectory cannot make
+    the squared norm overflow to inf and silently collapse the projected feature.
     """
-    硬流形投影 x = r_c * z / ||z||:
-      - target_radius 来自 bank (frozen)
-      - current_radius **不 detach** —— 保留真实 Jacobian
-        d(z/||z||)/dz = (I - u u^T) / ||z||,
-        径向分量被投影掉 (z -> a·z 不改变 x, 幅度作弊失去自由度),
-        切向(语义)梯度完整保留。
-    """
-    B = raw_x.shape[0]
-    M = radius_bank.shape[1]
-    bank_idx = torch.arange(B, device=raw_x.device) % M
-    target_radius = radius_bank[labels, bank_idx].unsqueeze(1)
-    current_radius = torch.sqrt(raw_x.pow(2).sum(dim=1, keepdim=True) + eps)
-    return raw_x * (target_radius / current_radius)
+    return _stable_project_to_pretrain_radius(
+        raw_x, labels, radius_bank, eps=eps)
 
 
 def diffusion_prior_anchor_loss(model, ref, eps=1e-8):
@@ -2315,7 +2379,7 @@ def compute_generator_disagreement_loss(fake_graph, fake_labels,
     生成器目标: 最大化 (总损失中使用负号)。
 
     loss_type='kl' (默认, 本方法/专利权6+S4.2 的设计):
-        对 softmax **预测分布**做 CKR 加权 KL 散度。
+        按 FedTAD Eq.(10) 对预测分布做 CKR 加权 KL(global‖local)。
     loss_type='l1' (原版 FedTAD 做法, 仅供消融):
         Σ_c Σ_k ckr[k,c] · mean|global_pred[c] − local_pred[c].detach()|, 作用在原始输出上
         (references/FedTAD/train_fedtad.py:342-345)
@@ -2338,10 +2402,13 @@ def compute_generator_disagreement_loss(fake_graph, fake_labels,
                 loss += w * torch.abs(
                     global_logits[idx_c] - t_logits[idx_c].detach()).mean()
             else:
-                global_log_prob = F.log_softmax(global_logits[idx_c], dim=-1)
-                teacher_prob = F.softmax(t_logits[idx_c], dim=-1).clamp(min=1e-8)
-                loss += w * F.kl_div(global_log_prob, teacher_prob,
-                                     reduction='batchmean')
+                # FedTAD Eq.(10) / patent S4.2: KL(global || local).
+                # Keep both model forward graphs w.r.t. fake_x so generator
+                # receives the correct adversarial input gradient; model
+                # parameters themselves are frozen by the caller.
+                loss += w * categorical_kl_from_logits(
+                    global_logits[idx_c], t_logits[idx_c],
+                    temperature=1.0, reduction='batchmean')
     return loss
 
 
@@ -2355,7 +2422,7 @@ def compute_student_distillation_loss(fake_graph, fake_labels,
     仅更新全局模型。
 
     loss_type='kl' (默认, 本方法/专利权6+S4.2 的设计):
-        以 CKR 为权重的 KL 散度, 对齐全局模型与本地模型的**预测分布**。
+        以 CKR 为权重的 KL(global‖local), 对齐全局模型与本地模型的**预测分布**。
     loss_type='l1' (原版 FedTAD 做法, 仅供消融):
         Σ_c Σ_k ckr[k,c] · mean|global_pred[c] − local_pred[c].detach()|, 作用在原始输出上。
     """
@@ -2366,16 +2433,11 @@ def compute_student_distillation_loss(fake_graph, fake_labels,
     loss = torch.tensor(0.0, device=device)
     each_class = {c: (fake_labels == c) for c in range(num_classes)}
     global_logits = global_model(fake_graph)
-    global_log_prob = F.log_softmax(global_logits / temperature, dim=-1)
 
-    # 教师前向与类别 c 无关 -> 每个教师只算一次; 教师侧本就 no_grad
+    # 教师前向与类别 c 无关 -> 每个教师只算一次; 教师侧 no_grad。
+    # KL 方向按 FedTAD Eq.(10) / patent S4.2 固定为 global || local。
     with torch.no_grad():
-        if loss_type == 'l1':
-            teacher_logits = [model_k(fake_graph) for model_k in local_models]
-        else:
-            teacher_probs = [F.softmax(model_k(fake_graph) / temperature,
-                                       dim=-1).clamp(min=1e-8)
-                             for model_k in local_models]
+        teacher_logits = [model_k(fake_graph) for model_k in local_models]
 
     for c in range(num_classes):
         idx_c = each_class[c]
@@ -2389,12 +2451,13 @@ def compute_student_distillation_loss(fake_graph, fake_labels,
                 loss += w * torch.abs(
                     global_logits[idx_c] - t_logits[idx_c]).mean()
         else:
-            for k_idx, t_prob in enumerate(teacher_probs):
+            for k_idx, t_logits in enumerate(teacher_logits):
                 w = normalized_ckr[k_idx, c]
                 if w < 1e-8:
                     continue
-                kl = F.kl_div(global_log_prob[idx_c], t_prob[idx_c],
-                              reduction='batchmean')
+                kl = categorical_kl_from_logits(
+                    global_logits[idx_c], t_logits[idx_c],
+                    temperature=temperature, reduction='batchmean')
                 loss += w * kl
 
     if loss_type == 'kl' and temperature != 1.0:
@@ -2802,6 +2865,12 @@ def main():
         assert args.proxy_checkpoint and os.path.exists(args.proxy_checkpoint), \
             f"--generator_init proxy_pretrained 需要存在的 --proxy_checkpoint: " \
             f"{args.proxy_checkpoint}"
+        try:
+            from pretrain_diffusion import load_proxy_pretrained_generator
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "--generator_init proxy_pretrained 需要 pretrain_diffusion.py；"
+                "当前包缺少该可选模块。正式 Stage1→Stage2 主线不依赖它。") from e
         ckpt_meta, skipped = load_proxy_pretrained_generator(
             args.proxy_checkpoint, generator, device)
         print(f"[Generator Init] 加载代理 DDPM 预训练权重: "
@@ -2842,7 +2911,8 @@ def main():
     #  S1: CKR (静态拓扑先验) + 动态 CKR 跟踪器
     # =================================================================
     print(f"\n[S1] 类别知识可靠性 (CKR mode = {args.ckr_mode})")
-    ckr_raw = compute_ckr(subgraphs, num_classes, args, device)
+    ckr_raw = compute_ckr(subgraphs, num_classes, args, device,
+                          data_identity=data_id_hash)
     # performance_only 为 dynamic_only 的规格别名
     ckr_mode_internal = 'dynamic_only' if args.ckr_mode == 'performance_only' else args.ckr_mode
     tracker = DynamicCKRTracker(
@@ -3014,7 +3084,7 @@ def main():
 
     start_round = 0
     best_val_primary = 0.0
-    best_test_primary = 0.0
+    best_test_primary = float('nan')
     best_round = -1
     pretrain_ref = None     # 联邦预训练后的参数锚 (L2-SP)
     radius_bank = None      # 预训练 radius bank [num_classes, bank_size]
@@ -3671,12 +3741,14 @@ def main():
             print("\n[Generator Update]")
 
             # 伪标签 (本轮 CKR 驱动)
+            label_rng = make_server_rng(device, args.seed, round_id, 1)
             fake_labels, counts = sample_fake_labels(
                 num_nodes=args.fake_nodes,
                 num_classes=num_classes,
                 strategy=args.fake_class_strategy,
                 ckr_weights=normalized_ckr.sum(dim=0).tolist(),
                 device=device,
+                generator=label_rng,
             )
             print(f"  伪标签分布: {[(c, counts[c]) for c in range(num_classes)]}")
 
@@ -3736,11 +3808,21 @@ def main():
 
                 # 可微生成 (full / checkpointed / truncated)
                 # radius 约束下取 raw 输出再投影: x = r_c·z/‖z‖, 堵住幅度作弊
+                init_rng = make_server_rng(
+                    device, args.seed, round_id, 100 + step * 2)
+                reverse_rng = make_server_rng(
+                    device, args.seed, round_id, 101 + step * 2)
+                init_noise = torch.randn(
+                    fake_labels.shape[0], generator.feat_dim,
+                    generator=init_rng, device=device)
                 raw_fake_x = generator.differentiable_sample(
                     labels=fake_labels, num_steps=sampling_steps,
                     backprop_mode=args.generator_backprop_mode,
                     truncate_interval=args.generator_truncate_interval,
-                    apply_output_bound=(not use_radius_proj))
+                    checkpoint_segments=args.checkpoint_segments,
+                    apply_output_bound=(not use_radius_proj),
+                    initial_noise=init_noise,
+                    noise_generator=reverse_rng)
                 fake_x = raw_fake_x
                 if use_radius_proj:
                     fake_x = project_to_pretrain_radius(
@@ -3780,7 +3862,17 @@ def main():
                                                            pretrain_ref)
                     L_G = L_G + args.lambda_diffusion_anchor * L_anchor
 
+                formal_finite_guard(
+                    args, round_id, f'generator_step_{step}_pre_backward',
+                    tensors={'raw_fake_x': raw_fake_x, 'projected_fake_x': fake_x,
+                             'L_sem': L_sem, 'L_dis': L_dis, 'L_div': L_div,
+                             'L_norm': L_norm, 'L_G': L_G, 'L_anchor': L_anchor},
+                    modules={'generator': generator})
+
                 L_G.backward()
+                formal_finite_guard(
+                    args, round_id, f'generator_step_{step}_post_backward',
+                    modules={'generator': generator}, check_grads=True)
 
                 grad_norm = math.sqrt(sum(p.grad.norm().item()**2
                                           for p in generator.parameters() if p.grad is not None))
@@ -3794,16 +3886,21 @@ def main():
                     print("  ⚠ 生成器梯度为零!")
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), 10.0)
                 gen_optimizer.step()
+                formal_finite_guard(
+                    args, round_id, f'generator_step_{step}_post_step',
+                    modules={'generator': generator})
                 L_G_report = L_G.item()
 
                 if torch.cuda.is_available():
                     gen_peak_mb = max(gen_peak_mb,
                                       torch.cuda.max_memory_allocated() / 1024 ** 2)
 
-                raw_r = torch.linalg.vector_norm(raw_fake_x, ord=2,
-                                                 dim=1).median().item()
-                proj_r = torch.linalg.vector_norm(fake_x, ord=2,
-                                                  dim=1).median().item()
+                # Diagnostics in float64: do not manufacture raw_r=inf merely
+                # because float32 sum-of-squares overflowed while raw elements
+                # are still finite.  The in-process health guard separately
+                # rejects truly nonfinite raw/projected tensors.
+                raw_r = diagnostic_l2_norm(raw_fake_x, dim=1).median().item()
+                proj_r = diagnostic_l2_norm(fake_x, dim=1).median().item()
                 ratio_extra = ""
                 if use_radius_proj:
                     _M = radius_bank.shape[1]
@@ -3823,7 +3920,7 @@ def main():
                       f"fake_x μ={fake_x.mean().item():.4f} "
                       f"σ={fake_x.std().item():.4f} "
                       f"raw_r={raw_r:.4f} proj_r={proj_r:.4f}"
-                      f"{extra}")
+                      f"{ratio_extra}{extra}")
 
             if pretrain_ref is not None:
                 drift = compute_theta_drift(generator, pretrain_ref)
@@ -3859,7 +3956,10 @@ def main():
                     fake_x_std=round(float(fake_x.std().item()), 6),
                     fake_x_min=round(float(fake_x.min().item()), 6),
                     fake_x_max=round(float(fake_x.max().item()), 6),
-                    fake_x_norm=round(float(fake_x.norm().item()), 6),
+                    fake_x_norm=round(float(diagnostic_l2_norm(
+                        fake_x, dim=1).mean().item()), 6),
+                    raw_radius_median=round(float(raw_r), 6),
+                    projected_radius_median=round(float(proj_r), 6),
                     fake_label_counts={int(c): int(n)
                                        for c, n in enumerate(counts)},
                     peak_gpu_mb=round(gen_peak_mb, 1),
@@ -3872,9 +3972,16 @@ def main():
             # 用推理 sample 生成最终伪图
             # 与生成器更新**同一参数化**: raw → radius 投影 → KNN (两边对抗同一分布)
             with torch.no_grad():
+                final_init_rng = make_server_rng(device, args.seed, round_id, 900)
+                final_reverse_rng = make_server_rng(device, args.seed, round_id, 901)
+                final_init_noise = torch.randn(
+                    fake_labels.shape[0], generator.feat_dim,
+                    generator=final_init_rng, device=device)
                 raw_fake_x = generator.sample(
                     labels=fake_labels, num_steps=sampling_steps, device=device,
-                    apply_output_bound=(not use_radius_proj))
+                    apply_output_bound=(not use_radius_proj),
+                    initial_noise=final_init_noise,
+                    noise_generator=final_reverse_rng)
                 fake_x = raw_fake_x
                 if use_radius_proj:
                     fake_x = project_to_pretrain_radius(
@@ -3914,7 +4021,14 @@ def main():
                     temperature=args.distill_temperature,
                     loss_type=args.distill_loss_type,
                 )
+                formal_finite_guard(
+                    args, round_id, f'distill_step_{step}_pre_backward',
+                    tensors={'L_D': L_D, 'fake_x': fake_x},
+                    modules={'global_model': global_model})
                 L_D.backward()
+                formal_finite_guard(
+                    args, round_id, f'distill_step_{step}_post_backward',
+                    modules={'global_model': global_model}, check_grads=True)
                 if math.isnan(L_D.item()):
                     _nan_diag([global_model], f'distill round {round_id} '
                                               f'L_D={L_D.item()}')
@@ -3923,6 +4037,9 @@ def main():
                 distill_grad_norm = max(distill_grad_norm, gn)
                 torch.nn.utils.clip_grad_norm_(global_model.parameters(), 10.0)
                 global_optimizer.step()
+                formal_finite_guard(
+                    args, round_id, f'distill_step_{step}_post_step',
+                    modules={'global_model': global_model})
                 L_D_report = L_D.item()
                 print(f"  step {step}: L_D={L_D.item():.4f} |grad|={gn:.4f}")
 
@@ -4023,8 +4140,9 @@ def main():
             global_model.eval()
             val_metrics = evaluate_global(global_model, subgraphs, args.task_mode,
                                           split='val', device=device)
-            if getattr(args, 'tuning_mode', False):
-                # test isolation: 调参模式完全不计算 test
+            if (getattr(args, 'tuning_mode', False)
+                    or getattr(args, 'final_test_only', False)):
+                # 调参期/正式决赛均不做逐轮 test；决赛仅训练结束后算一次
                 test_metrics = {k: float('nan') for k in val_metrics}
             else:
                 test_metrics = evaluate_global(global_model, subgraphs,

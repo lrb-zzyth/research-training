@@ -76,3 +76,7 @@ dataset/Physics/raw/
 dataset/Physics/processed/
 dataset/PubMed/raw/
 dataset/PubMed/processed/
+
+# V3 服务器部署包与 Windows 元数据(构建产物,不进仓库)
+FedTAD_SERVER_FINAL_V3.tar.gz
+*:Zone.Identifier

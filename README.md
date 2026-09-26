@@ -17,7 +17,7 @@
 
 ## 0. 版本更新说明（本次提交）
 
-> 本次提交 = **correctness 修复 + DDPM 机制修复 + 正式战役 v2 协议 + 服务器迁移准备** 的完整收口。
+> 本次提交 = **最终 correctness 修复 + DDPM 机制修复 + 正式战役 v3 协议 + 服务器迁移准备** 的完整收口。
 > 自上一版（`6318224`）以来累积：4 个文件改动 + 新增 tests/、formal campaign runner、迁移脚本与文档。
 
 ### 0.1 变更总览
@@ -25,11 +25,12 @@
 | 模块 | 主要变更 |
 |---|---|
 | **对比增强修复** | `edge_perturbation` 无向性 bug 修复：按无向边为单位删/加并展开双向（原实现按有向条目删/加，第二视图被削成部分有向图） |
+| **v3 数学修复** | KL 统一为 FedTAD Eq.(10)/专利 S4.2 的 `KL(global‖local)`；RWR 不再用全图随机节点补足局部子图，只在 anchor 连通分量内扩展；radius projection 改为等价但抗 float32 范数溢出的稳定实现。旧 v2 tuning 结果不得与 v3 混用。 |
 | **DDPM 三大根因修复** | ① 去噪网络信息瓶颈 → `timestep_scalar` 直通残差 `eps_pred = exp(g_t)·x_t + residual`（`--diffusion_skip_mode`）；② 联邦扩散预训练欠训练 → 样本加权损失统计 + S2 逐层诊断；③ reverse 链爆炸 → posterior variance β̃_t（`--use_posterior_variance`） |
 | **radius + anchor 机制** | pretrained radius bank 流形约束（`--radius_constraint`，`x = r_c·z/‖z‖` 堵幅度作弊）+ L2-SP 参数锚（`--lambda_diffusion_anchor`）+ Stage1 冻结 `c(t)`（`--diffusion_freeze_skip_scale`）+ Stage2 warm-up（`--server_start_round`） |
 | **优化器生命周期** | 新增 `--local_optimizer_lifecycle`（`persistent` 旧行为 / `reset_each_round` 正式主线）：persistent Adam + 每轮广播的陈旧动量是 PubMed-10 崩塌根因（peak drop −15.4 → −3.2） |
 | **RNG 协议 v2** | 客户端 round/client 确定性重播种 + 服务端专用 generator，配对实验 C/B 严格可比；定位并记录 CUDA scatter 类算子的跨进程数值非确定性 |
-| **正式战役 v2** | `experiments/accuracy_benchmark/formal_campaign.py`：每 (dataset,tier) 独立 Optuna study、validation-only objective、test isolation（`--tuning_mode` 调参期零 test 计算）、formal health v2（任何 nonfinite → trial FAIL 且排除候选）、protocol/data-identity 校验与安全 resume、显存看门狗 + 可配置并发（`--n_jobs`，默认 2；首 trial 恒串行生成 CKR 缓存防竞态） |
+| **正式战役 v3** | `experiments/accuracy_benchmark/formal_campaign.py`：每 (dataset,tier) 独立 Optuna study、validation-only objective、test isolation（`--tuning_mode` 调参期零 test 计算）、formal health v2（任何 nonfinite → trial FAIL 且排除候选）、protocol/data-identity 校验与安全 resume；单 GPU 正式协议固定 `--n_jobs 1` 严格串行。决赛用 `formal_final_eval.py`，每轮只看 validation，加载 val-best 后 test 仅计算一次。 |
 | **formal guard** | `--formal_campaign_guard`：启动校验 9 项正式协议（weighted CE ON / holdout 0 / accuracy 选轮 / reset optimizer / radius ON / align OFF / skip 冻结 / 不二次预训练 / Stage1 checkpoint 存在），违反即 ValueError |
 | **搜索空间 v2** | `lambda_sem ∈ {0.01,0.1,1.0}`（v1 的 0.001 因 Cora-5 实测 8/9 nonfinite/raw-runaway 移除）；`distill_steps ∈ {1,3,5}`（25 为 legacy 剔除）；新增 `server_start_round ∈ {0,1}` |
 | **测试** | 新增 `tests/`（generator 冻结 / checkpoint 状态管理 / resume freeze 策略 / Stage2 smoke / paired RNG / formal campaign 守卫与 test isolation 等 6 套件） |
@@ -57,9 +58,9 @@
 
 | 参数 | 旧默认 | 新默认 |
 |---|---|---|
-| `--use_weighted_ce` | 关（`store_true`） | **开**（`BooleanOptionalAction`） |
+| `--use_weighted_ce` | 关（`store_true`） | `BooleanOptionalAction` + task-mode 自动；正式 multiclass campaign 显式 **ON** |
 | `--class_weight_method` | `effective_num` | **`inverse`** |
-| `--diffusion_steps` | 50 | 10 |
+| `--diffusion_steps` | 50 | **20** |
 
 因此 **B1 基线必须显式加 `--no-use_weighted_ce`**（见 §8.4）。
 
@@ -163,7 +164,7 @@ CKR 是一个 `[num_clients, num_classes]` 矩阵，衡量每个客户端在每�
 
 #### 教师引导扩散式生成器（ConditionalDiffusionGenerator / TeacherGuidedDiffusionGenerator）— 核心
 
-条件扩散式伪节点生成器，从高斯噪声与类别条件出发，在冻结的客户端教师模型与当前全局模型反馈下训练。名称严格限定为 teacher-guided diffusion-style generator（不以标准 DDPM 自称；服务器通过它生成伪节点特征，而非恢复真实完整大图）。
+条件扩散式伪节点生成器，从高斯噪声与类别条件出发，在冻结的客户端教师模型与当前全局模型反馈下训练。实现为条件 DDPM：Stage1 在客户端真实特征上执行标准前向加噪/噪声预测联邦预训练，Stage2 在服务器端进行教师引导的对抗精调并生成伪节点特征。
 
 | 项目 | 说明 |
 |---|---|
@@ -213,7 +214,7 @@ loss = weighted_ce_loss + lambda_subgraph × subgraph_contrastive_loss
 | 改进 | 说明 |
 |---|---|
 | **Weighted CE** | 仅使用客户端 train 标签计算类别权重。支持 `inverse`（默认，`weight_c = N/(num_classes × n_c)`）和 `effective_num`（`weight_c = (1-β)/(1-βⁿᶜ)`）两种方法。缺失类别权重置 0（避免 NaN/除零），非零权重归一化到均值约 1 |
-| **Subgraph-Subgraph Cross-View Contrastive Loss**（`--contrastive_mode subgraph_cross_view`，核心）| 自监督子图-子图跨视图对比：本地边扰动构造两个图视图，RWR 采样每个中心节点的局部子图副本，中心节点特征在局部副本中置零，共享 GCN 编码后 mean readout。同一中心节点跨视图为正样本，不同中心节点为负样本，InfoNCE 损失。正负样本构造不读取标签 |
+| **Subgraph-Subgraph Cross-View Contrastive Loss**（`--contrastive_mode subgraph_cross_view`，核心）| 自监督子图-子图跨视图对比：本地边扰动构造两个图视图，RWR 采样每个中心节点的局部子图副本，中心节点特征在局部副本中置零，共享 GCN 编码后 mean readout。 当 RWR 在碎片连通分量中无法达到目标大小时，只在 anchor 所在连通分量内 BFS 扩展；连通分量不足则接受可变大小子图，绝不从其它连通分量随机补节点。同一中心节点跨视图为正样本，不同中心节点为负样本，InfoNCE 损失。正负样本构造不读取标签 |
 | **Static Topology CKR**（`--ckr_mode static_topology`，核心）| 基于固定节点属性与本地图拓扑计算类别知识可靠性，作为服务端融合客户端教师知识的权重。不依赖任何验证/测试指标，不随时间变化 |
 | **Teacher-Guided Diffusion-Style Pseudo-Graph Distillation**（`--distill_weighting static_ckr`，核心）| 服务器从高斯噪声与类别条件出发，使用冻结的客户端教师模型反馈训练扩散式伪节点生成器；以 KNN 依据伪节点特征构造伪图；按 CKR 融合教师知识后，在伪图上对全局模型做 KL 蒸馏（生成器阶段只更新生成器，蒸馏阶段只更新全局模型） |
 
@@ -232,14 +233,14 @@ loss = weighted_ce_loss + lambda_subgraph × subgraph_contrastive_loss
    | 损失 | 公式 | 作用 |
    |---|---|---|
    | **语义损失** | CKR 加权 CE（教师预测对齐伪标签）| 使生成特征可分 |
-   | **分歧损失** | 教师与全局预测的 KL（生成器最大化）| 对齐全局与局部模型 |
+   | **分歧损失** | `KL(global‖local)`（CKR 加权；生成器最大化）| 挖掘全局/本地模型分歧节点 |
    | **多样性损失** | 特征多样性正则 | 鼓励生成特征多样化 |
 
 6. **生成器更新**：只更新生成器参数（`set_requires_grad` 冻结全部教师与全局模型，置 eval；梯度仍能传回 `fake_x` 与生成器）
 
 #### 子阶段 4b：训练全局模型（`distill_steps` loop）
 
-固定生成器与客户端教师（冻结、eval），伪图由 `generator.sample` 在 `no_grad` 下生成；教师预测 detach；使用静态 CKR 加权教师分布，对全局模型执行教师到学生的 KL 蒸馏（只更新全局模型）。
+固定生成器与客户端教师（冻结、eval），伪图由 `generator.sample` 在 `no_grad` 下生成；教师预测 detach；使用静态 CKR 加权教师分布，对全局模型最小化 `KL(global‖local)`（只更新全局模型），方向与 FedTAD Eq.(10) / 专利 S4.2 一致。
 
 ### 阶段 5：全局聚合
 
