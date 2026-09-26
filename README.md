@@ -4,6 +4,11 @@
 > ① 客户端**子图-子图跨视图对比学习**（InfoNCE）；② 服务端**条件 DDPM 伪图生成 + CKR 加权 KL 无数据知识蒸馏**。
 > 目标：在 Cora / CiteSeer / PubMed / CS / Physics × 5/10/20 客户端三档上全面超越 FedTAD 论文 Table 2。
 > 附 Web 可视化训练/实验管理平台。
+>
+> **⚠️ 正式实验代码 = 冻结 tag [`v3-formal-f38f7fe74ab5`](https://github.com/lrb-zzyth/research-training/releases/tag/v3-formal-f38f7fe74ab5)**
+> （Formal Campaign V3：KL(global‖local) / component-safe RWR / overflow-safe projection，
+> 2026-09-26 部署于 RTX 4090 服务器产出 Cora/CiteSeer/PubMed/CS/Physics 正式结果）。
+> `main` 继续承担平台与后续开发，论文引用请用该 tag，不要用 main。
 
 本文档对应仓库当前状态。详细文档：
 - 平台使用：[docs/PLATFORM_GUIDE.md](docs/PLATFORM_GUIDE.md)
@@ -290,7 +295,7 @@ FedAvg：按客户端训练样本量（节点数）对参数做加权平均聚�
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--use_weighted_ce` | True | 启用类别加权交叉熵（仅使用客户端 train 标签计算权重） |
+| `--use_weighted_ce` | 关（`store_true`） | 启用类别加权交叉熵（仅使用客户端 train 标签计算权重）；正式 multiclass campaign 显式 **ON** |
 | `--class_weight_method` | inverse | 加权方法（inverse / effective_num） |
 | `--beta` | 0.999 | effective number 参数 |
 
@@ -324,10 +329,10 @@ FedAvg：按客户端训练样本量（节点数）对参数做加权平均聚�
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--diffusion_steps` | 10 | 扩散步数 |
+| `--diffusion_steps` | 20 | 扩散步数 |
 | `--diffusion_hidden` | 256 | 隐藏层维度 |
 | `--diffusion_beta_start` | 1e-4 | beta 起始值 |
-| `--diffusion_beta_end` | 0.02 | beta 终止值 |
+| `--diffusion_beta_end` | 0.5 | beta 终止值 |
 | `--generator_lr` | 1e-3 | 生成器学习率 |
 | `--distill_lr` | 1e-3 | 蒸馏学习率 |
 | `--lambda_sem` | 1.0 | 语义损失权重 |
