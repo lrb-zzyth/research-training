@@ -64,34 +64,43 @@ def main():
             key = f'{ds}_c{tier}'
             cell = cells.get(key)
             ours = None
+            partial_seeds = False
             if cell and cell['finals'].get('test_mean') is not None:
                 ours = (cell['finals']['test_mean'],
                         cell['finals'].get('test_std'))
+                if cell['finals'].get('seeds_available', 3) < 3:
+                    partial_seeds = True
             pmean, pstd = PAPER[ds][tier]
             delta = round(ours[0] - pmean, 2) if ours else None
             row = {'dataset': ds, 'clients': tier,
                    'ours_mean': ours[0] if ours else None,
                    'ours_std': ours[1] if ours else None,
                    'fedtad_mean': pmean, 'fedtad_std': pstd,
-                   'delta': delta}
+                   'delta': delta,
+                   'seeds_available': (cell['finals'].get('seeds_available')
+                                       if cell else None)}
             if ours is None:
                 ds_complete = False
             else:
-                totals['cells_complete'] += 1
-                totals['final_seeds'] += 3
-                totals['final_test_evals'] += 3
-                if delta > 0:
-                    totals['wins'] += 1
-                elif delta < 0:
-                    totals['losses'] += 1
-                else:
-                    totals['ties'] += 1
+                seeds_avail = cell['finals'].get('seeds_available', 3) or 0
+                totals['final_seeds'] += seeds_avail
+                totals['final_test_evals'] += seeds_avail
                 if (cell.get('stage1_health') or {}).get('verdict') == 'PASS':
                     totals['stage1_pass'] += 1
                 st = cell.get('study') or {}
                 totals['attempts'] += st.get('attempts') or 0
                 totals['healthy'] += st.get('healthy') or 0
                 totals['failed_trials'] += st.get('failed') or 0
+                if not partial_seeds:
+                    totals['cells_complete'] += 1
+                    if delta > 0:
+                        totals['wins'] += 1
+                    elif delta < 0:
+                        totals['losses'] += 1
+                    else:
+                        totals['ties'] += 1
+                else:
+                    ds_complete = False
             rows.append(row)
         if ds_complete:
             totals['datasets_complete'] += 1
@@ -110,7 +119,11 @@ def main():
          '| Dataset | Clients | Ours (mean ± std) | FedTAD paper (mean ± std) | Delta |',
          '|---|---|---|---|---|']
     for r in rows:
-        ours = ('%.2f ± %.2f' % (r['ours_mean'], r['ours_std'])
+        tag = ''
+        if r['ours_mean'] is not None and r.get('seeds_available') \
+                and r['seeds_available'] < 3:
+            tag = ' (%d/3 seeds)' % r['seeds_available']
+        ours = (('%.2f ± %.2f' % (r['ours_mean'], r['ours_std'])) + tag
                 if r['ours_mean'] is not None else '—')
         fed = '%.1f ± %.1f' % (r['fedtad_mean'], r['fedtad_std'])
         delta = ('%+.2f' % r['delta']) if r['delta'] is not None else '—'
@@ -123,8 +136,9 @@ def main():
           '- Stage1 PASS: %d' % totals['stage1_pass'],
           '- Optuna attempts: %d | healthy: %d | failed: %d'
           % (totals['attempts'], totals['healthy'], totals['failed_trials']),
-          '- final seeds: %d (15 cells × 3)' % totals['final_seeds'],
-          '- final test evaluations: %d (每 seed exactly once)'
+          '- final seeds: %d (每 seed exactly once; 缺 seed 如实标注)'
+          % totals['final_seeds'],
+          '- final test evaluations: %d (与完成 seed 数一致)'
           % totals['final_test_evals'],
           '- tuning test evaluations: %d (全程 --tuning_mode)'
           % totals['tuning_test_evals'],

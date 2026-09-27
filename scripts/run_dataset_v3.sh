@@ -204,7 +204,7 @@ while :; do
       failed) continue;;
     esac
     case $(finals_status "$tier") in
-      done) continue;;
+      done|failed) continue;;   # failed = cell 已 STOP, 同样视为终态
       *) all_terminal=0;;
     esac
   done
@@ -248,7 +248,7 @@ while :; do
 
     case $(stage1_status "$tier") in
       running) continue;;
-      failed)  log "$DS c$tier: Stage1 FAIL -> cell STOP"; continue;;
+      failed)  [ -f "$d/.stop_logged" ] || { log "$DS c$tier: Stage1 FAIL -> cell STOP"; touch "$d/.stop_logged"; }; continue;;
       todo)    launch_phase "$tier" stage1 bash scripts/generate_stage1_cell.sh "$DS" "$tier"; continue;;
     esac
 
@@ -276,7 +276,7 @@ PY
 
     case $(tuning_status "$tier") in
       running) continue;;
-      failed)  log "$DS c$tier: tuning FAIL -> cell STOP"; continue;;
+      failed)  [ -f "$d/.stop_logged" ] || { log "$DS c$tier: tuning FAIL -> cell STOP"; touch "$d/.stop_logged"; }; continue;;
       todo)    launch_phase "$tier" tuning bash scripts/run_formal_cell.sh "$DS" "$tier" "$TARGET" "$MAX_ATTEMPTS" 1; continue;;
     esac
 
@@ -300,7 +300,7 @@ PY
 
     case $(finals_status "$tier") in
       running) continue;;
-      failed)  log "$DS c$tier: finals FAIL -> cell STOP"; continue;;
+      failed)  [ -f "$d/.stop_logged" ] || { log "$DS c$tier: finals FAIL -> cell STOP"; touch "$d/.stop_logged"; }; continue;;
       todo)    launch_phase "$tier" finals bash scripts/run_formal_final.sh "$DS" "$tier"; continue;;
     esac
   done

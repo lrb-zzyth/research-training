@@ -110,6 +110,14 @@ def summarize(ds):
         # --- Finals ---
         finals = load(os.path.join(d, 'final', 'final_3seed_summary.json'))
         c['finals'] = {}
+        if finals is None:
+            # fallback: 3seed summary 缺失时, 如实报告已完成的 per-seed 结果
+            finals = {}
+            for s in (2024, 2025, 2026):
+                fm = load(os.path.join(d, 'final', f'seed_{s}',
+                                       'final_metrics.json'))
+                if fm is not None:
+                    finals[str(s)] = fm
         if finals:
             for seed_s, fm in sorted(finals.items()):
                 entry = {'best_val': (fm or {}).get('best_val_primary'),
@@ -123,6 +131,7 @@ def summarize(ds):
                 c['finals'][seed_s] = entry
             tests = [e['test_acc'] for e in c['finals'].values()
                      if e['test_acc'] is not None]
+            c['finals']['seeds_available'] = len(tests)
             if tests:
                 mean = sum(tests) / len(tests)
                 var = sum((t - mean) ** 2 for t in tests) / len(tests)
