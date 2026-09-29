@@ -60,7 +60,6 @@ presentation/
 
 # 数据集：仓库仅分发 Cora + Louvain(10 客户端) 基线子图
 # 其余切分变体由划分脚本按需重新生成，避免仓库膨胀
-dataset/CiteSeer/
 dataset/Cora/Client2/
 dataset/Cora/Client*/Louvain_enriched*/
 dataset/Cora/Client*/Louvain_frozen*/
@@ -76,6 +75,8 @@ dataset/Physics/raw/
 dataset/Physics/processed/
 dataset/PubMed/raw/
 dataset/PubMed/processed/
+dataset/CiteSeer/raw/
+dataset/CiteSeer/processed/
 
 # V3 服务器部署包与 Windows 元数据(构建产物,不进仓库)
 FedTAD_SERVER_FINAL_V3.tar.gz
